@@ -10,12 +10,12 @@ struct UsageSnapshot {
     key_source: String, // "env" / "missing"
 }
 
-fn get_api_key() -> Option<(String, String)> {
+fn get_api_key() -> Option<String> {
     for env_name in &["MINIMAX_API_KEY", "MINIMAX_CP_TOKEN"] {
         if let Ok(v) = std::env::var(env_name) {
             let trimmed = v.trim();
             if !trimmed.is_empty() {
-                return Some((trimmed.to_string(), env_name.to_string()));
+                return Some(trimmed.to_string());
             }
         }
     }
@@ -26,8 +26,8 @@ fn get_api_key() -> Option<(String, String)> {
 async fn fetch_minimax_usage() -> UsageSnapshot {
     let fetched_at = chrono::Utc::now().to_rfc3339();
 
-    let (key, key_source) = match get_api_key() {
-        Some(t) => t,
+    let key = match get_api_key() {
+        Some(k) => k,
         None => {
             return UsageSnapshot {
                 found: false,
@@ -50,7 +50,7 @@ async fn fetch_minimax_usage() -> UsageSnapshot {
                 error: Some(format!("client build: {e}")),
                 raw: serde_json::json!({}),
                 fetched_at,
-                key_source,
+                key_source: "env".to_string(),
             }
         }
     };
@@ -73,23 +73,25 @@ async fn fetch_minimax_usage() -> UsageSnapshot {
                     error: Some(format!("HTTP {} — {}", status, &text[..text.len().min(200)])),
                     raw: serde_json::json!({}),
                     fetched_at,
-                    key_source,
+                    key_source: "env".to_string(),
                 };
             }
+            // 调试用：把 API 真实响应写到 stderr（不进 UI，敏感信息不进聊天历史）
+            eprintln!("[minimax API] HTTP {} body: {}", status, &text[..text.len().min(2000)]);
             match serde_json::from_str::<serde_json::Value>(&text) {
                 Ok(v) => UsageSnapshot {
                     found: true,
                     error: None,
                     raw: v,
                     fetched_at,
-                    key_source,
+                    key_source: "env".to_string(),
                 },
                 Err(e) => UsageSnapshot {
                     found: false,
                     error: Some(format!("JSON parse: {e}")),
                     raw: serde_json::json!({}),
                     fetched_at,
-                    key_source,
+                    key_source: "env".to_string(),
                 },
             }
         }
@@ -98,7 +100,7 @@ async fn fetch_minimax_usage() -> UsageSnapshot {
             error: Some(format!("network: {e}")),
             raw: serde_json::json!({}),
             fetched_at,
-            key_source,
+            key_source: "env".to_string(),
         },
     }
 }
