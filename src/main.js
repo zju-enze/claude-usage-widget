@@ -249,36 +249,12 @@ async function submitSetup() {
     btn.textContent = "连接并保存";
   }
 }
-
-// ─── 自启动 toggle ──────────────────────────────────────────
-async function refreshAutostart() {
-  const cb = document.getElementById("autostart-cb");
-  if (!cb) return;
-  try {
-    const enabled = await invoke("is_autostart_enabled");
-    cb.checked = !!enabled;
-  } catch (e) {
-    cb.checked = false;
-  }
-}
-
-async function setupAutostart() {
-  const cb = document.getElementById("autostart-cb");
-  if (!cb) return;
-  cb.addEventListener("change", async () => {
-    try {
-      if (cb.checked) {
-        const ok = await invoke("enable_autostart");
-        if (!ok) cb.checked = false;
-      } else {
-        await invoke("disable_autostart");
-      }
-    } catch (e) {
-      tlog("error", "autostart toggle failed: " + e);
-      cb.checked = false;
-    }
-  });
-}
+// ─── 启动逻辑 ──────────────────────────────────────────
+// 1. 默认隐藏（Rust 端 setup 阶段已经 hide）
+// 2. 后台线程每 5s 查 claude.exe：
+//    - 启动 → show
+//    - 关闭 → hide
+// 所以 widget 永远不"独立"显示 —— 只能跟随 Claude Code 出现。
 
 function setupSetupHandlers() {
   document.getElementById("setup-submit").addEventListener("click", (e) => { e.stopPropagation(); submitSetup(); });
@@ -299,15 +275,16 @@ async function init() {
     setupButtons();
     tlog("info", "init: setupButtons done");
     setupSetupHandlers();
-    setupAutostart();
     tlog("info", "init: setupSetupHandlers done, calling probe_state");
     const probeResult = await probe();
     tlog("info", "init: probe_state returned " + JSON.stringify(probeResult));
     if (!probeResult.has_key) {
+      // 注意：setup overlay 现在**默认就显示**，因为 widget 进程被启动
+      // 通常意味着用户想要配置什么。但窗口本身是 hide 的（Claude Code 没在）。
+      // Setup 是配置流，不是显示主界面；可以保留显示。
       showSetup(true);
       setStatus("请先连接 MiniMax", true);
     } else {
-      await refreshAutostart();
       refresh();
       setInterval(refresh, REFRESH_MS);
     }

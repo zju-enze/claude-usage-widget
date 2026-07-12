@@ -560,7 +560,9 @@ pub fn run() {
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
+                // 默认隐藏。Claude Code 在跑时，后台线程会把它 show 出来；
+                // Claude Code 关掉 → 隐藏。widget 永远不"独立"显示。
+                let _ = window.hide();
                 let _ = window.unminimize();
 
                 let monitor_size: Option<(u32, u32)> = window
