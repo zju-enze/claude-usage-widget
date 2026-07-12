@@ -167,16 +167,32 @@ mod keystore {
 }
 
 fn get_api_key() -> Option<String> {
-    // 1) env var
     for env_name in &["MINIMAX_API_KEY", "MINIMAX_CP_TOKEN"] {
+        // 1) 进程级 env var（shell 启动时设的）
         if let Ok(v) = std::env::var(env_name) {
             let trimmed = v.trim();
             if !trimmed.is_empty() {
                 return Some(trimmed.to_string());
             }
         }
+        // 2) Windows User-level env var（setx 设置的、GUI 进程能读到）
+        #[cfg(target_os = "windows")]
+        {
+            use winreg::enums::*;
+            use winreg::RegKey;
+            if let Ok(hkcu) = RegKey::predef(HKEY_CURRENT_USER)
+                .open_subkey(r"Environment")
+            {
+                if let Ok(v) = hkcu.get_value::<String, _>(env_name) {
+                    let trimmed = v.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
     }
-    // 2) 已加密存盘的
+    // 3) 已加密存盘的
     if let Ok(bytes) = keystore::load() {
         if let Ok(s) = std::str::from_utf8(&bytes) {
             let trimmed = s.trim();
@@ -279,9 +295,25 @@ fn frontend_log(level: String, msg: String) {
 #[tauri::command]
 fn probe_state() -> ProbeState {
     let path = keystore::key_path();
+
+    // 1) process-level env
     if std::env::var("MINIMAX_API_KEY").is_ok() || std::env::var("MINIMAX_CP_TOKEN").is_ok() {
         return ProbeState { has_key: true, source: "env".to_string(), path: path.to_string_lossy().to_string() };
     }
+    // 2) Windows User-level env (setx)
+    #[cfg(target_os = "windows")]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        if let Ok(hkcu) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(r"Environment") {
+            for name in &["MINIMAX_API_KEY", "MINIMAX_CP_TOKEN"] {
+                if hkcu.get_value::<String, _>(name).is_ok() {
+                    return ProbeState { has_key: true, source: "env".to_string(), path: path.to_string_lossy().to_string() };
+                }
+            }
+        }
+    }
+    // 3) 加密存盘
     match keystore::load() {
         Ok(bytes) if !bytes.is_empty() => ProbeState {
             has_key: true,
