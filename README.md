@@ -37,23 +37,23 @@ Authorization: Bearer <sk-cp-...>
 
 ## 安装
 
+普通用户走这里：到 [Releases](https://github.com/zju-enze/claude-usage-widget/releases) 下载 `.msi` 或 NSIS `.exe` 安装包：
+
+| 安装包 | 大小 | 行为 |
+|---|---|---|
+| `Claude Usage Widget_0.1.0_x64_en-US.msi` | ~4.5 MB | 标准 Windows Installer（推荐）；安装到 Program Files，安装完成界面默认勾选"启动 widget" |
+| `Claude Usage Widget_0.1.0_x64-setup.exe` | ~2.8 MB | NSIS 安装器，更轻量 |
+
+安装完会自动启动 widget。第一次启动会弹出 **setup 向导**，让你填 MiniMax sk-cp key（AES-256-GCM 加密存到 `%APPDATA%\.claude-usage-widget\key.bin`，非明文）。主区有 **"登录时自动启动"** 复选框 —— 勾选会在 `HKCU\...\Run\ClaudeUsageWidget` 加注册项，跟随系统启动，与 Claude Code 一同出现。
+
+**仓库开发者**走以下流程：
+
 ```bash
-# 1. 克隆本仓库
 git clone https://github.com/zju-enze/claude-usage-widget.git
 cd claude-usage-widget
-
-# 2. 安装 Node 依赖
 npm install
-
-# 3. 设置 sk-cp key（两种方式任选）
-#    方式 a：在当前 shell 设环境变量（仅本会话）
-$env:MINIMAX_API_KEY = "eyJhbGciOi..."
-#    方式 b：写入 .env.local（自动加载，不入 git）
-"eyJhbGciOi..." | Out-File -Encoding ascii .env.local
-"MINIMAX_API_KEY" | Out-File -Encoding ascii -Append .env.local
-
-# 4. 启动（首次 cargo build 较慢，需要 5–10 分钟）
-npm run tauri dev
+npm run tauri dev          # 调试模式
+npm run tauri build        # 出 msi + nsis 安装包到 src-tauri\target\release\bundle\
 ```
 
 启动后悬浮窗自动出现在主屏右上角。**首次自动拉一次 API**，状态行会显示 `key=env · 18:42:01`。

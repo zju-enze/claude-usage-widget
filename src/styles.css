@@ -429,3 +429,26 @@ details[open] summary::after { transform: rotate(90deg); }
 /* 工具类 */
 .dim { opacity: 0.55; }
 .hidden { display: none !important; }
+
+/* 开机启动 toggle */
+.autostart-toggle {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--glass-border);
+  display: flex;
+  justify-content: flex-end;
+}
+.toggle-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  user-select: none;
+}
+.toggle-row input[type="checkbox"] {
+  accent-color: var(--accent);
+  cursor: pointer;
+  margin: 0;
+}

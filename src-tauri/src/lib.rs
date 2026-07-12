@@ -360,6 +360,121 @@ fn clear_key() -> Result<(), String> {
     Ok(())
 }
 
+/// 把当前 exe 注册到 Windows 启动项（HKCU\...\Run\ClaudeUsageWidget）。
+/// 仅 Windows。第一次启动时调用：用户如果点"开机启动"打钩，安装完就会自动注册。
+#[tauri::command]
+fn enable_autostart(app: tauri::AppHandle) -> Result<bool, String> {
+    #[cfg(target_os = "windows")]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+        // exe 路径用引号包起来，避免空格问题
+        let value = format!("\"{}\"", exe.display());
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let run_key = hkcu
+            .open_subkey_with_flags(
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                KEY_SET_VALUE | KEY_QUERY_VALUE,
+            )
+            .map_err(|e| format!("open Run: {e}"))?;
+        run_key
+            .set_value("ClaudeUsageWidget", &value)
+            .map_err(|e| format!("set Run: {e}"))?;
+        eprintln!("[claude-usage-widget] autostart enabled → {}", value);
+        let _ = app;
+        Ok(true)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        Ok(false)
+    }
+}
+
+#[tauri::command]
+fn disable_autostart() -> Result<bool, String> {
+    #[cfg(target_os = "windows")]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let run_key = hkcu
+            .open_subkey_with_flags(
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                KEY_SET_VALUE,
+            )
+            .map_err(|e| format!("open Run: {e}"))?;
+        match run_key.delete_value("ClaudeUsageWidget") {
+            Ok(_) => {
+                eprintln!("[claude-usage-widget] autostart disabled");
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!("delete: {e}")),
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    Ok(false)
+}
+
+#[tauri::command]
+fn is_autostart_enabled() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        if let Ok(run_key) =
+            hkcu.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
+        {
+            return run_key.get_value::<String, _>("ClaudeUsageWidget").is_ok();
+        }
+        false
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+/// 检查 Claude Code 是否正在运行。
+/// Windows：枚举进程找 `claude.exe`（Electron 桌面端进程名）。
+/// 其他平台：暂只做 Windows（项目本身就是 Win 优先）。
+fn is_claude_code_running() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        // 简单实现：tasklist 找 claude.exe
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq claude.exe"])
+            .output();
+        match out {
+            Ok(o) => {
+                let s = String::from_utf8_lossy(&o.stdout);
+                // tasklist 在没找到时会输出 "INFO: No tasks are running..."
+                s.contains("claude.exe")
+            }
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+#[tauri::command]
+fn claude_code_running() -> bool {
+    is_claude_code_running()
+}
+
+#[tauri::command]
+fn set_autohide(_enabled: bool) {
+    // 前端 toggle 标记。简化：当前实现忽略此参数（永远检测）。
+    // 留接口以便未来实现"用户暂时关掉自动联动"。
+    let _ = _enabled;
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -371,6 +486,11 @@ pub fn run() {
             save_key_and_test,
             open_url,
             clear_key,
+            claude_code_running,
+            set_autohide,
+            enable_autostart,
+            disable_autostart,
+            is_autostart_enabled,
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
@@ -401,6 +521,28 @@ pub fn run() {
                         );
                     }
                 }
+
+                // 启动后台线程：每 5s 检查 Claude Code 进程是否在跑
+                // 在 → show 窗口；不在 → hide
+                std::thread::spawn({
+                    let window = window.clone();
+                    let mut claude_running = false;
+                    move || loop {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        let running = is_claude_code_running();
+                        if running != claude_running {
+                            if running {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                                eprintln!("[claude-usage-widget] claude.exe detected → show");
+                            } else {
+                                let _ = window.hide();
+                                eprintln!("[claude-usage-widget] claude.exe gone → hide");
+                            }
+                            claude_running = running;
+                        }
+                    }
+                });
             }
             Ok(())
         })
