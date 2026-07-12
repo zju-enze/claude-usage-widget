@@ -439,23 +439,57 @@ fn is_autostart_enabled() -> bool {
 }
 
 /// 检查 Claude Code 是否正在运行。
-/// Windows：枚举进程找 `claude.exe`（Electron 桌面端进程名）。
+/// Windows：用 Win32 EnumProcesses（不依赖 cmd.exe、不弹控制台窗口）。
 /// 其他平台：暂只做 Windows（项目本身就是 Win 优先）。
 fn is_claude_code_running() -> bool {
     #[cfg(target_os = "windows")]
     {
-        // 简单实现：tasklist 找 claude.exe
-        let out = std::process::Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq claude.exe"])
-            .output();
-        match out {
-            Ok(o) => {
-                let s = String::from_utf8_lossy(&o.stdout);
-                // tasklist 在没找到时会输出 "INFO: No tasks are running..."
-                s.contains("claude.exe")
-            }
-            Err(_) => false,
+        use windows::Win32::System::ProcessStatus::{
+            EnumProcesses, K32GetModuleFileNameExW,
+        };
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        use windows::Win32::Foundation::CloseHandle;
+
+        const MAX_PIDS: usize = 4096;
+        let mut pids = vec![0u32; MAX_PIDS];
+        let mut bytes_returned = 0u32;
+        // SAFETY: EnumProcesses 写入到 pids 缓冲区。我们传递足够大的缓冲区。
+        let result = unsafe {
+            EnumProcesses(pids.as_mut_ptr(), (MAX_PIDS * 4) as u32, &mut bytes_returned)
+        };
+        if result.is_err() {
+            return false;
         }
+        let n_pids = (bytes_returned as usize) / std::mem::size_of::<u32>();
+        for &pid in pids.iter().take(n_pids) {
+            if pid == 0 {
+                continue;
+            }
+            // SAFETY: OpenProcess 返回 Result<HANDLE>; 失败就是 0（无效句柄）
+            let handle_res = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) };
+            let handle = match handle_res {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            let mut buf = [0u16; 256];
+            // windows 0.58: K32GetModuleFileNameExW 接收 HANDLE 接口；
+            // 直接传 handle（HANDLE 类型）或 .into() 转。
+            let len = unsafe {
+                K32GetModuleFileNameExW(handle, None, &mut buf)
+            };
+            unsafe { let _ = CloseHandle(handle); }
+            if len == 0 { continue; }
+            let path = String::from_utf16_lossy(&buf[..len as usize]).to_lowercase();
+            if path.ends_with("\\claude.exe")
+                || path.ends_with("/claude.exe")
+                || path.contains("claude code")
+            {
+                return true;
+            }
+        }
+        false
     }
     #[cfg(not(target_os = "windows"))]
     {
