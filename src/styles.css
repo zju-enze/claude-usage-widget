@@ -1,0 +1,272 @@
+/* Claude Usage Widget — 浮动卡片 */
+
+:root {
+  --bg: rgba(20, 22, 28, 0.78);
+  --bg-solid: #14161c;
+  --fg: #e8e8ec;
+  --fg-dim: #8b8f9a;
+  --good: #5cd49a;
+  --warn: #f7c452;
+  --bad: #ef6f6c;
+  --border: rgba(255, 255, 255, 0.07);
+  --hover: rgba(255, 255, 255, 0.08);
+  --accent: #d97757;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: rgba(245, 245, 248, 0.78);
+    --bg-solid: #f5f5f8;
+    --fg: #1a1a1f;
+    --fg-dim: #6b6f7a;
+    --border: rgba(0, 0, 0, 0.08);
+    --hover: rgba(0, 0, 0, 0.06);
+  }
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 11px;
+  color: var(--fg);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+body {
+  background: var(--bg-solid);
+}
+
+#widget {
+  width: 100%;
+  height: 100%;
+  background: var(--bg-solid);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+}
+
+/* 顶部标题栏 */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border-bottom: 1px solid var(--border);
+  cursor: grab;
+  user-select: none;
+}
+
+header:active { cursor: grabbing; }
+
+.title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  color: var(--fg);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.title::before {
+  content: "●";
+  color: var(--accent);
+  font-size: 8px;
+}
+
+.header-actions {
+  display: flex;
+  gap: 2px;
+}
+
+.header-actions button {
+  width: 18px;
+  height: 18px;
+  border: none;
+  background: transparent;
+  color: var(--fg-dim);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: inherit;
+  transition: background 0.1s, color 0.1s;
+}
+
+.header-actions button:hover {
+  background: var(--hover);
+  color: var(--fg);
+}
+
+#btn-close:hover {
+  background: var(--bad);
+  color: white;
+}
+
+/* 主体内容 */
+main {
+  padding: 10px 12px 8px;
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+main::-webkit-scrollbar { display: none; }
+
+/* 进度条块 */
+.bar-block {
+  margin-bottom: 8px;
+}
+
+.bar-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  margin-bottom: 4px;
+  color: var(--fg-dim);
+}
+
+.bar-label .right {
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+}
+
+.bar-bg {
+  width: 100%;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  background: var(--good);
+  border-radius: 3px;
+  transition: width 0.4s ease, background 0.3s ease;
+  width: 0%;
+}
+
+.bar-fill.warn { background: var(--warn); }
+.bar-fill.bad { background: var(--bad); }
+
+/* 键值对 */
+.kv {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  font-size: 10px;
+}
+
+.kv-row {
+  display: flex;
+  justify-content: space-between;
+  color: var(--fg-dim);
+}
+
+.kv-row .v {
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 模型分布 */
+details {
+  margin-top: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+
+summary {
+  cursor: pointer;
+  font-size: 10px;
+  color: var(--fg-dim);
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+summary::-webkit-details-marker { display: none; }
+
+summary::after {
+  content: "▸";
+  font-size: 10px;
+  transition: transform 0.15s;
+}
+
+details[open] summary::after {
+  transform: rotate(90deg);
+}
+
+#models-list {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 10px;
+}
+
+.model-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.model-row .name {
+  flex: 0 0 56px;
+  color: var(--fg-dim);
+  text-transform: lowercase;
+}
+
+.model-row .mbar-bg {
+  flex: 1;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.model-row .mbar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+}
+
+.model-row .pct {
+  flex: 0 0 38px;
+  text-align: right;
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 状态行 */
+.status {
+  font-size: 9px;
+  color: var(--fg-dim);
+  margin-top: 8px;
+  text-align: center;
+  font-style: italic;
+}
+
+/* 折叠态 */
+#widget.collapsed main { display: none; }
+#widget.collapsed { height: 36px !important; }
+
+.dim {
+  opacity: 0.55;
+}

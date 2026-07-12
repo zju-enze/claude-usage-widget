@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Claude Usage</title>
+  </head>
+  <body>
+    <div id="widget" data-tauri-drag-region>
+      <header data-tauri-drag-region>
+        <span class="title" data-tauri-drag-region>Claude Usage</span>
+        <div class="header-actions">
+          <button id="btn-refresh" title="刷新">⟳</button>
+          <button id="btn-collapse" title="折叠/展开">−</button>
+          <button id="btn-close" title="关闭">×</button>
+        </div>
+      </header>
+
+      <main id="content">
+        <section class="bar-block" id="block-5h">
+          <div class="bar-label">
+            <span class="left">5 小时</span>
+            <span class="right" id="fiveHour-text">—</span>
+          </div>
+          <div class="bar-bg">
+            <div class="bar-fill" id="fiveHour-fill" style="width:0%"></div>
+          </div>
+        </section>
+
+        <section class="bar-block" id="block-7d">
+          <div class="bar-label">
+            <span class="left">7 天</span>
+            <span class="right" id="sevenDay-text">—</span>
+          </div>
+          <div class="bar-bg">
+            <div class="bar-fill" id="sevenDay-fill" style="width:0%"></div>
+          </div>
+        </section>
+
+        <section class="kv" id="block-stats">
+          <div class="kv-row"><span class="k">消息</span><span class="v" id="messages">—</span></div>
+          <div class="kv-row"><span class="k">重置</span><span class="v" id="resets-in">—</span></div>
+        </section>
+
+        <details id="block-models">
+          <summary>模型分布</summary>
+          <div id="models-list"></div>
+        </details>
+
+        <div class="status" id="status">等待数据…</div>
+      </main>
+    </div>
+
+    <script type="module" src="main.js" defer></script>
+  </body>
+</html>
