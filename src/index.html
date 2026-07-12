@@ -21,30 +21,31 @@
         <section class="bar-block" id="block-5h">
           <div class="bar-label">
             <span class="left">5 小时</span>
-            <span class="right" id="fiveHour-text">—</span>
+            <span class="right" id="fiveHour-pct">—</span>
           </div>
           <div class="bar-bg">
             <div class="bar-fill" id="fiveHour-fill" style="width:0%"></div>
           </div>
+          <div class="bar-sub" id="fiveHour-resets">—</div>
         </section>
 
         <section class="bar-block" id="block-7d">
           <div class="bar-label">
             <span class="left">7 天</span>
-            <span class="right" id="sevenDay-text">—</span>
+            <span class="right" id="sevenDay-pct">—</span>
           </div>
           <div class="bar-bg">
             <div class="bar-fill" id="sevenDay-fill" style="width:0%"></div>
           </div>
+          <div class="bar-sub" id="sevenDay-resets">—</div>
         </section>
 
-        <section class="kv" id="block-stats">
-          <div class="kv-row"><span class="k">消息</span><span class="v" id="messages">—</span></div>
-          <div class="kv-row"><span class="k">重置</span><span class="v" id="resets-in">—</span></div>
-        </section>
+        <div id="model-block" style="display:none;margin-top:6px;font-size:10px;color:var(--fg-dim);">
+          模型 <span id="model-name">—</span>
+        </div>
 
         <details id="block-models">
-          <summary>模型分布</summary>
+          <summary>各模型剩余 %</summary>
           <div id="models-list"></div>
         </details>
 

@@ -1,69 +1,109 @@
 # Claude Usage Widget
 
-一个常驻桌面右上角的浮动卡片，实时显示 Claude Code 用量（5h 会话 + 7d 周配额 + 消息数 + 模型分布）。
+一个常驻桌面右上角的浮动卡片，显示 **MiniMax Token Plan** 的实时用量（5 小时窗口 + 7 天周配额 + 各模型剩余 % + 重置倒计时）。
 
-后端数据来自 [Claude-Code-Usage-Monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor) 的 `--write-state` 输出（写到 `~/.claude-monitor/state/latest.json`）。
-本项目只做悬浮显示层，不重复实现用量计算 / 订阅识别。
+后端数据来自 MiniMax Coding Plan 官方 API：
+
+```
+GET https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains
+Authorization: Bearer <sk-cp-...>
+```
+
+直接调用、返回 JSON、解析后渲染。不依赖 claude-monitor 之类的中间层。
 
 ## 字段预览
 
 ```
 ┌─ Claude Usage ───── ✕ ┐
 │ 5 小时                  │
-│ ▓▓▓▓▓▓░░░░ 60% · 2h 14m │
+│ ▓▓▓░░░░░░░ 剩 60%        │
+│ 重置 2h 14m · 13:42–18:42│
 │ 7 天                    │
-│ ▓▓░░░░░░░░ 12% · 4d 03h │
-│ ─────────────           │
-│ 消息     54 条          │
-│ 重置     2h 14m         │
-│ ▸ 模型分布              │
+│ ▓▓░░░░░░░░ 剩 12%        │
+│ 重置 4d 03h             │
+│ 模型 MiniMax-Text-01    │
+│ ▸ 各模型剩余 %           │
 └────────────────────────┘
 ```
+
+进度条是"剩余 %"：绿色表示剩得多（≥60%）、黄色注意（30–60%）、红色要省着用（<30%）。
 
 ## 环境要求
 
 - **Rust** stable（1.78+）
 - **Node.js** 18+
 - **WebView2**（Win11 / 较新的 Win10 预装）
+- **MiniMax Coding Plan**（Plus/Pro/Max 等 Token Plan 订阅），sk-cp key 一个
 
 ## 安装
 
-```powershell
-# 1. 装 Claude-Code-Usage-Monitor（数据源）
-uv tool install claude-monitor
-
-# 2. 克隆本仓库
-git clone <repo-url>
+```bash
+# 1. 克隆本仓库
+git clone https://github.com/zju-enze/claude-usage-widget.git
 cd claude-usage-widget
 
-# 3. 安装依赖
+# 2. 安装 Node 依赖
 npm install
+
+# 3. 设置 sk-cp key（两种方式任选）
+#    方式 a：在当前 shell 设环境变量（仅本会话）
+$env:MINIMAX_API_KEY = "eyJhbGciOi..."
+#    方式 b：写入 .env.local（自动加载，不入 git）
+"eyJhbGciOi..." | Out-File -Encoding ascii .env.local
+"MINIMAX_API_KEY" | Out-File -Encoding ascii -Append .env.local
 
 # 4. 启动（首次 cargo build 较慢，需要 5–10 分钟）
 npm run tauri dev
 ```
 
-启动后悬浮窗自动出现在主屏右上角。
+启动后悬浮窗自动出现在主屏右上角。**首次自动拉一次 API**，状态行会显示 `key=env · 18:42:01`。
 
-> 想立即看到数据的话，先单次跑一次：
-> ```bash
-> claude-monitor --once --write-state
-> ```
-> 这会立刻生成 `~/.claude-monitor/state/latest.json`，悬浮窗第一次刷新就能看到内容。
+> 找不到 key 的话，进 https://platform.minimaxi.com/user-center/basic-information/interface-key 复制 sk-cp 开头的那个。
 
-## 后台常驻 monitor
+## 数据怎么来的
 
-悬浮窗只**读取** state.json，不会启动 monitor。要让数据持续更新，每 5 秒跑一次 monitor：
+悬浮窗**每 30 秒**直接调用 MiniMax 官方 API：
 
-```bash
-# 手动跑一次（前台，ctrl+c 退出）
-claude-monitor --write-state --refresh-rate 5 --no-clear
-
-# 或者用项目自带的脚本（出错自动重启）
-scripts/start-monitor.bat
+```
+GET https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains
+Authorization: Bearer <MINIMAX_API_KEY>
+referer: https://platform.minimaxi.com/
 ```
 
-`start-monitor.bat` 把日志写到 `%USERPROFILE%\.claude-monitor\monitor.log`。
+返回 JSON 长这样（节选）：
+
+```json
+{
+  "model_remains": [
+    {
+      "model_name": "MiniMax-Text-01",
+      "current_interval_total_count": 5000,
+      "current_interval_remaining_percent": 87,
+      "remains_time": 1234567,
+      "current_weekly_total_count": 50000,
+      "current_weekly_remaining_percent": 100,
+      "weekly_remains_time": 6789012,
+      "start_time": "2026-07-12T13:00:00+08:00",
+      "end_time":   "2026-07-12T18:00:00+08:00"
+    }
+  ]
+}
+```
+
+字段含义：
+
+| 字段 | 含义 |
+|---|---|
+| `current_interval_*` | 当前 5 小时窗口（默认）|
+| `current_weekly_*` | 当前 7 天窗口 |
+| `*_remaining_percent` | **剩余 %**（不是已用 %）|
+| `remains_time` / `weekly_remains_time` | 距下次重置的毫秒数 |
+
+进度条颜色：
+
+- 剩 ≥60% → 绿色（healthy）
+- 剩 30–60% → 黄色（warning）
+- 剩 <30% → 红色（urgent）
 
 ## 开机自启（可选）
 

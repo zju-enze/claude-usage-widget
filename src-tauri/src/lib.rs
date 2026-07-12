@@ -1,80 +1,118 @@
-use std::fs;
-use std::path::PathBuf;
-
 use serde::Serialize;
 use tauri::Manager;
 
 #[derive(Serialize)]
-struct MonitorState {
+struct UsageSnapshot {
     found: bool,
-    path: String,
+    error: Option<String>,
     raw: serde_json::Value,
     fetched_at: String,
+    key_source: String, // "env" / "missing"
 }
 
-fn default_state_path() -> PathBuf {
-    // 优先 USERPROFILE / HOME，再 fallback 到当前目录
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        return PathBuf::from(home)
-            .join(".claude-monitor")
-            .join("state")
-            .join("latest.json");
+fn get_api_key() -> Option<(String, String)> {
+    for env_name in &["MINIMAX_API_KEY", "MINIMAX_CP_TOKEN"] {
+        if let Ok(v) = std::env::var(env_name) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return Some((trimmed.to_string(), env_name.to_string()));
+            }
+        }
     }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".claude-monitor")
-            .join("state")
-            .join("latest.json");
-    }
-    PathBuf::from(".claude-monitor/state/latest.json")
+    None
 }
 
 #[tauri::command]
-fn read_monitor_state() -> MonitorState {
-    let path = default_state_path();
+async fn fetch_minimax_usage() -> UsageSnapshot {
     let fetched_at = chrono::Utc::now().to_rfc3339();
 
-    match fs::read_to_string(&path) {
-        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(v) => MonitorState {
-                found: true,
-                path: path.to_string_lossy().to_string(),
-                raw: v,
-                fetched_at,
-            },
-            Err(e) => MonitorState {
+    let (key, key_source) = match get_api_key() {
+        Some(t) => t,
+        None => {
+            return UsageSnapshot {
                 found: false,
-                path: format!("{} (parse error: {})", path.display(), e),
+                error: Some("Missing API key. Set MINIMAX_API_KEY (or MINIMAX_CP_TOKEN) env var.".to_string()),
                 raw: serde_json::json!({}),
                 fetched_at,
-            },
-        },
-        Err(_) => MonitorState {
+                key_source: "missing".to_string(),
+            }
+        }
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return UsageSnapshot {
+                found: false,
+                error: Some(format!("client build: {e}")),
+                raw: serde_json::json!({}),
+                fetched_at,
+                key_source,
+            }
+        }
+    };
+
+    let resp = client
+        .get("https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains")
+        .header("Authorization", format!("Bearer {key}"))
+        .header("referer", "https://platform.minimaxi.com/")
+        .header("Accept", "application/json")
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return UsageSnapshot {
+                    found: false,
+                    error: Some(format!("HTTP {} — {}", status, &text[..text.len().min(200)])),
+                    raw: serde_json::json!({}),
+                    fetched_at,
+                    key_source,
+                };
+            }
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(v) => UsageSnapshot {
+                    found: true,
+                    error: None,
+                    raw: v,
+                    fetched_at,
+                    key_source,
+                },
+                Err(e) => UsageSnapshot {
+                    found: false,
+                    error: Some(format!("JSON parse: {e}")),
+                    raw: serde_json::json!({}),
+                    fetched_at,
+                    key_source,
+                },
+            }
+        }
+        Err(e) => UsageSnapshot {
             found: false,
-            path: path.to_string_lossy().to_string(),
+            error: Some(format!("network: {e}")),
             raw: serde_json::json!({}),
             fetched_at,
+            key_source,
         },
     }
-}
-
-#[tauri::command]
-fn state_file_path() -> String {
-    default_state_path().to_string_lossy().to_string()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![read_monitor_state, state_file_path])
+        .invoke_handler(tauri::generate_handler![fetch_minimax_usage])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
-                // 先 show，避免 hidden 状态导致 outer_size 返回 0
                 let _ = window.show();
                 let _ = window.unminimize();
 
-                // 拿到屏幕大小（拷贝出来避免借用问题）
                 let monitor_size: Option<(u32, u32)> = window
                     .primary_monitor()
                     .ok()
@@ -84,7 +122,6 @@ pub fn run() {
                         (s.width, s.height)
                     });
 
-                // 用内尺寸兜底（更可能在 setup 阶段就有效）
                 let win_size = window
                     .inner_size()
                     .unwrap_or(tauri::PhysicalSize::new(280, 200));

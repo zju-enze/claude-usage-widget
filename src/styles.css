@@ -159,8 +159,16 @@ main::-webkit-scrollbar { display: none; }
   width: 0%;
 }
 
+.bar-fill.good { background: var(--good); }
 .bar-fill.warn { background: var(--warn); }
-.bar-fill.bad { background: var(--bad); }
+.bar-fill.bad  { background: var(--bad); }
+
+.bar-sub {
+  font-size: 9px;
+  color: var(--fg-dim);
+  margin-top: 3px;
+  font-variant-numeric: tabular-nums;
+}
 
 /* 键值对 */
 .kv {
@@ -227,7 +235,7 @@ details[open] summary::after {
   gap: 6px;
 }
 
-.model-row .name {
+.model-row .mname {
   flex: 0 0 56px;
   color: var(--fg-dim);
   text-transform: lowercase;
@@ -247,7 +255,10 @@ details[open] summary::after {
   border-radius: 2px;
 }
 
-.model-row .pct {
+.model-row .mbar-fill.warn { background: var(--warn); }
+.model-row .mbar-fill.bad  { background: var(--bad); }
+
+.model-row .mpct {
   flex: 0 0 38px;
   text-align: right;
   color: var(--fg);
