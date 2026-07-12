@@ -11,6 +11,7 @@ const tlog = (level, msg) => {
   console[level === "info" ? "log" : level]("[FE]", msg);
 };
 tlog("info", "main.js loaded, window=" + (getCurrentWindow ? "ok" : "MISSING"));
+tlog("info", "readyState=" + document.readyState + ", has-setup-overlay=" + !!document.getElementById("setup-overlay"));
 
 const REFRESH_MS = 30000; // 30s 远程拉一次（API 限速）
 const TZ = "Asia/Shanghai";
@@ -190,8 +191,102 @@ function setupButtons() {
   });
 }
 
-window.addEventListener("DOMContentLoaded", () => {
-  setupButtons();
-  refresh();
-  setInterval(refresh, REFRESH_MS);
-});
+// ─── 启动探测 ──────────────────────────────────────────
+async function probe() {
+  try {
+    const state = await invoke("probe_state");
+    return state;
+  } catch (e) {
+    return { has_key: false, source: "error", error: String(e) };
+  }
+}
+
+function showSetup(show) {
+  tlog("info", "showSetup(" + show + ")");
+  const overlay = document.getElementById("setup-overlay");
+  tlog("info", "overlay el: " + !!overlay);
+  if (!overlay) return;
+  overlay.classList.toggle("hidden", !show);
+  const content = document.getElementById("content");
+  if (content) content.style.opacity = show ? "0.25" : "1";
+  const hdr = document.querySelector("header");
+  if (hdr) hdr.style.opacity = show ? "0.25" : "1";
+  if (show) {
+    setTimeout(() => {
+      const i = document.getElementById("setup-key-input");
+      if (i) i.focus();
+    }, 100);
+  }
+}
+
+async function submitSetup() {
+  const input = document.getElementById("setup-key-input");
+  const errEl = document.getElementById("setup-error");
+  const btn = document.getElementById("setup-submit");
+  const key = input.value.trim();
+  errEl.textContent = "";
+  if (!key || !key.startsWith("sk-cp-") || key.length < 20) {
+    errEl.textContent = "sk-cp key 应该以 'sk-cp-' 开头";
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = "连接中…";
+  try {
+    const result = await invoke("save_key_and_test", { key });
+    if (result.ok) {
+      // 保存成功 → 隐藏 setup、开始刷新
+      input.value = "";
+      showSetup(false);
+      refresh();
+    } else {
+      errEl.textContent = `保存/测试失败：${result.error || "未知错误"}`;
+      btn.disabled = false;
+      btn.textContent = "连接并保存";
+    }
+  } catch (e) {
+    errEl.textContent = `出错了：${e}`;
+    btn.disabled = false;
+    btn.textContent = "连接并保存";
+  }
+}
+
+function setupSetupHandlers() {
+  document.getElementById("setup-submit").addEventListener("click", (e) => { e.stopPropagation(); submitSetup(); });
+  document.getElementById("setup-key-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.stopPropagation(); submitSetup(); }
+    e.stopPropagation(); // 防止被 Tauri drag region 拦截
+  });
+  document.getElementById("setup-help").addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    invoke("open_url", { url: "https://platform.minimaxi.com/user-center/basic-information/interface-key" }).catch(() => {});
+  });
+}
+
+async function init() {
+  try {
+    tlog("info", "init: start");
+    setupButtons();
+    tlog("info", "init: setupButtons done");
+    setupSetupHandlers();
+    tlog("info", "init: setupSetupHandlers done, calling probe_state");
+    const probeResult = await probe();
+    tlog("info", "init: probe_state returned " + JSON.stringify(probeResult));
+    if (!probeResult.has_key) {
+      showSetup(true);
+      setStatus("请先连接 MiniMax", true);
+    } else {
+      refresh();
+      setInterval(refresh, REFRESH_MS);
+    }
+  } catch (e) {
+    tlog("error", "init failed: " + e.message);
+    document.body.innerHTML += '<pre style="color:red;padding:10px;font-size:11px;">[BOOT_ERR] ' + e.message + '</pre>';
+  }
+}
+
+if (document.readyState === "loading") {
+  window.addEventListener("DOMContentLoaded", () => init());
+} else {
+  init();
+}

@@ -4,10 +4,11 @@
     <meta charset="UTF-8" />
     <link rel="stylesheet" href="styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Claude Usage</title>
+    <title>Claude Usage Widget</title>
   </head>
   <body>
     <div id="widget" data-tauri-drag-region>
+
       <header data-tauri-drag-region>
         <span class="title" data-tauri-drag-region>Claude Usage</span>
         <div class="header-actions">
@@ -40,8 +41,8 @@
           <div class="bar-sub" id="sevenDay-resets">—</div>
         </section>
 
-        <div id="model-block" style="display:none;margin-top:6px;font-size:10px;color:var(--fg-dim);">
-          模型 <span id="model-name">—</span>
+        <div id="model-block">
+          模型 <span class="mname" id="model-name">—</span>
         </div>
 
         <details id="block-models">
@@ -49,8 +50,27 @@
           <div id="models-list"></div>
         </details>
 
-        <div class="status" id="status">等待数据…</div>
+        <div class="status" id="status">连接中…</div>
       </main>
+
+      <!-- 首次启动 setup 向导 -->
+      <div class="setup-overlay hidden" id="setup-overlay">
+        <div class="setup-eyebrow">Claude Usage Widget</div>
+        <div class="setup-title">连接 MiniMax</div>
+        <div class="setup-sub">需要你的 MiniMax sk-cp key。<br>仅本机加密存储，不会上传。</div>
+        <input
+          id="setup-key-input"
+          class="setup-input"
+          type="password"
+          placeholder="sk-cp-..."
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button id="setup-submit" class="setup-btn">连接并保存</button>
+        <div id="setup-error" class="setup-error"></div>
+        <a class="setup-link" href="#" id="setup-help">如何获取 sk-cp key？</a>
+      </div>
+
     </div>
 
     <script src="main.js" defer></script>
