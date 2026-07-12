@@ -53,6 +53,30 @@
       </main>
     </div>
 
-    <script type="module" src="main.js" defer></script>
+    <script src="main.js" defer></script>
+    <script>
+      // 超级内联诊断：load 完立刻调 invoke，看是否生效
+      window.addEventListener("DOMContentLoaded", function() {
+        try {
+          if (window.__TAURI__ && window.__TAURI__.core) {
+            window.__TAURI__.core.invoke("frontend_log", { level: "info", msg: "INLINE_OK_DOM_READY" });
+          } else {
+            // 说明 __TAURI__ 还没注入到 window 上，等 200ms 再试
+            setTimeout(function() {
+              if (window.__TAURI__ && window.__TAURI__.core) {
+                window.__TAURI__.core.invoke("frontend_log", { level: "info", msg: "INLINE_OK_DELAYED" });
+              } else {
+                // WebView 完全没注入 __TAURI__ global - 这是 dev mode 的典型坑
+                document.body.style.background = "#911";
+                document.body.innerHTML += '<pre style="color:white;padding:8px;font-size:10px">[FE_TAURI_MISSING]</pre>';
+              }
+            }, 200);
+          }
+        } catch (e) {
+          document.body.style.background = "#911";
+          document.body.innerHTML += '<pre style="color:white;padding:8px;font-size:10px">[FE_JS_ERR] ' + e.message + '</pre>';
+        }
+      });
+    </script>
   </body>
 </html>

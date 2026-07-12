@@ -24,6 +24,7 @@ fn get_api_key() -> Option<String> {
 
 #[tauri::command]
 async fn fetch_minimax_usage() -> UsageSnapshot {
+    eprintln!("[minimax] fetch_minimax_usage called");
     let fetched_at = chrono::Utc::now().to_rfc3339();
 
     let key = match get_api_key() {
@@ -105,15 +106,23 @@ async fn fetch_minimax_usage() -> UsageSnapshot {
     }
 }
 
+#[tauri::command]
+fn frontend_log(level: String, msg: String) {
+    eprintln!("[frontend {}] {}", level, msg);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![fetch_minimax_usage])
+        .invoke_handler(tauri::generate_handler![fetch_minimax_usage, frontend_log])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.unminimize();
+                // 临时：打开 DevTools 用于诊断前端
+                #[cfg(debug_assertions)]
+                let _ = window.open_devtools();
 
                 let monitor_size: Option<(u32, u32)> = window
                     .primary_monitor()

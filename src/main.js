@@ -1,5 +1,17 @@
-const { invoke } = window.__TAURI__.core;
-const { getCurrentWindow } = window.__TAURI__.window;
+let invoke = null;
+let getCurrentWindow = null;
+try {
+  invoke = window.__TAURI__.core.invoke;
+  getCurrentWindow = window.__TAURI__.window.getCurrentWindow;
+} catch (e) {
+  // 顶层失败也要显示出来
+  document.body.innerHTML += '<pre style="color:red;padding:8px;font-size:10px">[FE_TOP_ERR] ' + e.message + '</pre>';
+}
+const tlog = (level, msg) => {
+  if (invoke) invoke("frontend_log", { level, msg }).catch(() => {});
+  console[level === "info" ? "log" : level]("[FE]", msg);
+};
+tlog("info", "MAIN_JS_TOP_OK" + (getCurrentWindow ? " window=ok" : " window=MISSING"));
 
 const REFRESH_MS = 30000; // 30s 远程拉一次（API 限速）
 const TZ = "Asia/Shanghai";
@@ -158,7 +170,6 @@ async function refresh() {
         week.reset,
         "本周",
       );
-    }
     }
 
     document.getElementById("model-name").textContent = m.model_name || "MiniMax";
