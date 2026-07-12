@@ -4,14 +4,13 @@ try {
   invoke = window.__TAURI__.core.invoke;
   getCurrentWindow = window.__TAURI__.window.getCurrentWindow;
 } catch (e) {
-  // 顶层失败也要显示出来
   document.body.innerHTML += '<pre style="color:red;padding:8px;font-size:10px">[FE_TOP_ERR] ' + e.message + '</pre>';
 }
 const tlog = (level, msg) => {
   if (invoke) invoke("frontend_log", { level, msg }).catch(() => {});
   console[level === "info" ? "log" : level]("[FE]", msg);
 };
-tlog("info", "MAIN_JS_TOP_OK" + (getCurrentWindow ? " window=ok" : " window=MISSING"));
+tlog("info", "main.js loaded, window=" + (getCurrentWindow ? "ok" : "MISSING"));
 
 const REFRESH_MS = 30000; // 30s 远程拉一次（API 限速）
 const TZ = "Asia/Shanghai";
@@ -28,11 +27,10 @@ function fmt(n) {
 }
 function escapeHtml(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
-function fmtDuration(value) {
-  if (value == null || value <= 0) return "—";
-  // 自动检测单位：如果值看起来像秒（< 1 千万），按秒；否则按毫秒
-  const looksLikeSeconds = value < 1e7;
-  const totalSec = looksLikeSeconds ? Math.floor(value) : Math.floor(value / 1000);
+function fmtDuration(ms) {
+  if (ms == null || ms <= 0) return "—";
+  // API 给的就是毫秒
+  const totalSec = Math.floor(ms / 1000);
   const d = Math.floor(totalSec / 86400);
   const h = Math.floor((totalSec % 86400) / 3600);
   const m = Math.floor((totalSec % 3600) / 60);
@@ -41,13 +39,14 @@ function fmtDuration(value) {
   return `${m} 分`;
 }
 
-function fmtTimeUTC(iso) {
-  if (!iso) return "—";
-  try {
-    return new Date(iso).toLocaleTimeString("zh-CN", {
-      hour: "2-digit", minute: "2-digit", timeZone: TZ, hour12: false,
-    });
-  } catch { return "—"; }
+function fmtTimeLocal(ms) {
+  if (!ms) return "—";
+  const v = Number(ms);
+  if (isNaN(v) || v <= 0) return "—";
+  // API 返回毫秒级 Unix 时间戳
+  return new Date(v).toLocaleTimeString("zh-CN", {
+    hour: "2-digit", minute: "2-digit", timeZone: TZ, hour12: false,
+  });
 }
 
 // ─── 状态行 ──────────────────────────────────────────────
@@ -93,23 +92,22 @@ function renderModels(list) {
     root.innerHTML = '<div class="dim" style="padding:6px 0;">无数据</div>';
     return;
   }
-  list
-    .filter(m => num(m.weeklyTotal) > 0)
-    .forEach((m) => {
-      // `weeklyPercentage` 是"剩余 %"。已用 = 100 - rem
-      let rem = Number(m.weeklyPercentage);
-      if (!isNaN(rem) && rem <= 1) rem = rem * 100;
-      const used = isNaN(rem) ? 0 : Math.max(0, Math.min(100, 100 - rem));
-      const cls = used >= 90 ? "bad" : used >= 70 ? "warn" : "";
-      const row = document.createElement("div");
-      row.className = "model-row";
-      row.innerHTML = `
-        <span class="mname">${escapeHtml(m.name || "?")}</span>
-        <span class="mbar-bg"><span class="mbar-fill ${cls}" style="width:${used}%"></span></span>
-        <span class="mpct">${used.toFixed(0)}%</span>
-      `;
-      root.appendChild(row);
-    });
+  list.forEach((m) => {
+    // current_weekly_remaining_percent 是剩余%，已用 = 100 - rem
+    const rem = Number(m.current_weekly_remaining_percent);
+    const used = isNaN(rem) ? 0 : Math.max(0, Math.min(100, 100 - rem));
+    const cls = used >= 90 ? "bad" : used >= 70 ? "warn" : "";
+    const row = document.createElement("div");
+    row.className = "model-row";
+    const status = m.current_interval_status === 1 ? "" :
+                   m.current_interval_status === 3 ? " (赠送)" : " (?)";
+    row.innerHTML = `
+      <span class="mname">${escapeHtml(m.model_name || "?")}${status}</span>
+      <span class="mbar-bg"><span class="mbar-fill ${cls}" style="width:${used}%"></span></span>
+      <span class="mpct">${used.toFixed(0)}%</span>
+    `;
+    root.appendChild(row);
+  });
 }
 
 // ─── 主刷新 ──────────────────────────────────────────────
@@ -125,54 +123,39 @@ async function refresh() {
       setStatus("API 返回无 model_remains", true);
       return;
     }
-    const m = arr[0];
 
-    const five = {
-      rem:   m.current_interval_remaining_percent,
-      total: m.current_interval_total_count,
-      reset: m.remains_time,
-      start: m.start_time,
-      end:   m.end_time,
-    };
-    const week = {
-      rem:   m.current_weekly_remaining_percent,
-      total: m.current_weekly_total_count,
-      reset: m.weekly_remains_time,
-      unlimited: m.current_weekly_total_count === 0 && m.current_weekly_remaining_percent == null,
-    };
+    // 找出主模型：current_interval_status === 1 表示在用（=3 是赠送额度）
+    const primary = arr.find(x => x.current_interval_status === 1) || arr[0];
 
-    function usedFromRemaining(rem) {
-      if (rem == null) return null;
-      // API 在不同账户/计划下可能返回 0–100（剩余）或者 0–1（小数）。
-      // 安全处理两种情况：<1 视为小数，要 × 100
-      let v = Number(rem);
-      if (v <= 1) v = v * 100;
-      // 业务侧语义是"已用"，所以已用 = 100 - 剩余
+    // `start_time`/`end_time` 是毫秒级 Unix 时间戳；`remains_time` 是毫秒数。
+    function used(remaining) {
+      if (remaining == null) return null;
+      const v = Number(remaining);
+      // 直接用：API 返回 0–100 整数（已用% = 100 - 剩余%）
       return Math.max(0, Math.min(100, 100 - v));
     }
 
+    const fiveRem = primary.current_interval_remaining_percent;
+    const weekRem = primary.current_weekly_remaining_percent;
+    const fiveResetsMs = Number(primary.remains_time) || 0;
+    const weekResetsMs = Number(primary.weekly_remains_time) || 0;
+    const startMs = Number(primary.start_time);
+    const endMs   = Number(primary.end_time);
+
     paintBar(
       "fiveHour-fill", "fiveHour-pct", "fiveHour-resets",
-      usedFromRemaining(five.rem),
-      five.reset,
-      `${fmtTimeUTC(five.start)}–${fmtTimeUTC(five.end)}`,
+      used(fiveRem),
+      fiveResetsMs,
+      `${fmtTimeLocal(startMs)}–${fmtTimeLocal(endMs)}`,
+    );
+    paintBar(
+      "sevenDay-fill", "sevenDay-pct", "sevenDay-resets",
+      used(weekRem),
+      weekResetsMs,
+      "本周",
     );
 
-    if (week.unlimited) {
-      document.getElementById("sevenDay-fill").style.width = "0%";
-      document.getElementById("sevenDay-fill").className = "bar-fill good";
-      document.getElementById("sevenDay-pct").textContent = "无限制";
-      document.getElementById("sevenDay-resets").textContent = "本周不限量";
-    } else {
-      paintBar(
-        "sevenDay-fill", "sevenDay-pct", "sevenDay-resets",
-        usedFromRemaining(week.rem),
-        week.reset,
-        "本周",
-      );
-    }
-
-    document.getElementById("model-name").textContent = m.model_name || "MiniMax";
+    document.getElementById("model-name").textContent = primary.model_name || "?";
     document.getElementById("model-block").style.display = "block";
 
     renderModels(arr);
