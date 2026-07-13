@@ -26,15 +26,6 @@ const REFRESH_MS = 30000; // 30s 远程拉一次（API 限速）
 const TZ = "Asia/Shanghai";
 
 // ─── 工具 ──────────────────────────────────────────────
-function pct(n) { if (n == null) return null; return Math.max(0, Math.min(100, Number(n))); }
-function num(n) { if (n == null) return 0; return Number(n); }
-function fmt(n) {
-  if (n == null || isNaN(n)) return "—";
-  const v = Number(n);
-  if (v >= 1e8) return (v / 1e8).toFixed(1).replace(/\.0$/, "") + " 亿";
-  if (v >= 1e4) return (v / 1e4).toFixed(1).replace(/\.0$/, "") + " 万";
-  return v.toLocaleString("zh-CN");
-}
 function escapeHtml(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
 function fmtDuration(ms) {
@@ -63,11 +54,6 @@ function fmtTimeLocal(ms) {
 let _lastUpdatedAt = null;          // Date | null —— 内部状态
 let _refreshInFlight = false;       // 防止叠加请求
 let _refreshFailed = false;         // 最近一次是否失败
-
-function setStatus(_msg, _isErr) {
-  // 旧版底部 env · time 状态行已删除。这里保留为空实现，
-  // 保证历史调用点不会崩。lastUpdated 状态用 _lastUpdatedAt 单独维护。
-}
 
 function setConnectionState(state) {
   // state: "idle" | "loading" | "ok" | "warn" | "error"
@@ -168,12 +154,7 @@ function paintBar(fillId, pctId, subId, usedPct, resetMs, subText) {
 //   在没有权威数据源时，"硬编码 + 显示" 就是编造数据，违反本项目"真实数据驱动"原则。
 //
 // 当前 UI 中已无套餐行。如果未来 minimaxi 提供返回套餐名的端点，
-// 实现 Rust 端 read_plan_metadata + 前端套餐行。
-
-async function loadPlanMetadata() {
-  // 后端始终返回 None —— 调用保留以便将来扩展，但当前不做任何 UI 更新。
-  try { await invoke("read_plan_metadata"); } catch (e) { /* 静默 */ }
-}
+// 再启用 read_plan_metadata + 前端套餐行。
 
 // ─── 当前模型读取 ───────────────────────────────────────
 // 严禁从 Token Plan API 的 model_name 字段推断当前模型。
@@ -417,8 +398,8 @@ async function init() {
     setupSetupHandlers();
     tlog("info", "init: setupSetupHandlers done");
 
-    // 套餐 + 当前模型：与用量解耦，独立加载
-    await Promise.all([loadPlanMetadata(), loadActiveModel()]);
+    // 当前模型：与用量解耦，独立加载
+    await loadActiveModel();
 
     setConnectionState("idle");
     const probeResult = await probe();

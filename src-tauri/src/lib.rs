@@ -465,26 +465,9 @@ fn err_kind_label(k: crate::api::UsageErrorKind) -> &'static str {
 /// `frontend_log` 已删除（生产构建绝不接收前端任意字符串并写入 stderr）。
 /// 前端调试日志请使用 `console.*` 由 WebView 自己管理。
 
-/// 当前套餐暂不在 UI 展示。
-///
-/// 原因：`/v1/api/openplatform/coding_plan/remains` 端点不返回套餐名称，
-/// 公开的 minimaxi.com 开发者文档也未列出专门的套餐信息端点。
-/// 在不能从权威数据源读取的情况下，"硬编码套餐名 + 徽标" 等同于编造数据，
-/// 不符合本项目"真实数据驱动"原则。
-///
-/// 如果未来 minimaxi 提供返回套餐名的公开端点（如 `/v1/api/openplatform/coding_plan/info`），
-/// 在这里实现真正的读取逻辑后，再恢复前端套餐行。
-#[tauri::command]
-fn read_plan_metadata() -> Option<PlanMetadata> {
-    None
-}
-
-#[derive(Serialize)]
-struct PlanMetadata {
-    raw_plan_name: Option<String>,
-    display_plan_name: String,
-    plan_badge: Option<String>,
-}
+/// read_plan_metadata / PlanMetadata 已删除。
+/// 套餐信息不在 UI 中展示——API 不返回套餐名称，硬编码等于编造数据。
+/// 如果未来 minimaxi 提供返回套餐名的公开端点，再实现新的 invoke 命令。
 
 #[derive(Serialize)]
 struct ActiveModelInfo {
@@ -795,7 +778,6 @@ pub fn run() {
             enable_autostart,
             disable_autostart,
             is_autostart_enabled,
-            read_plan_metadata,
             read_active_model,
         ])
         .setup(|app| {
