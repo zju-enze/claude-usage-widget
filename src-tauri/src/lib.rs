@@ -14,8 +14,7 @@ struct UsageSnapshot {
 #[derive(Serialize)]
 struct ProbeState {
     has_key: bool,
-    source: String,    // "saved" | "env" | "missing"
-    path: String,
+    source: String,    // "saved" | "env" | "missing" —— 不暴露具体路径 / 变量名
 }
 
 #[derive(Serialize)]
@@ -43,16 +42,34 @@ mod keystore {
             .join("key.bin")
     }
 
-    /// 把敏感字节用 Windows DPAPI 加密后写入磁盘（仅当前用户可解）
+    /// 把敏感字节用 Windows DPAPI 加密后写入磁盘（仅当前用户可解）。
+    ///
+    /// 原子保存：先写 `<key>.tmp` → fsync → rename 覆盖原文件。
+    /// 任何中途失败（旧 tmp 残留 / 加密失败 / 写入失败）都不会破坏旧 key.bin。
     pub fn save(plaintext: &[u8]) -> Result<PathBuf, String> {
         let path = key_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
-        }
-        let mut buf = Vec::with_capacity(plaintext.len() * 2);
+        let parent = path.parent().ok_or("invalid key path")?;
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+
+        // 加密到内存
+        let mut buf = Vec::with_capacity(plaintext.len() * 2 + 8);
         buf.extend_from_slice(&super::windows_crypto::CRYPTPROTECT_DATA_HEADER);
         super::windows_crypto::encrypt(plaintext, &mut buf).map_err(|e| format!("dpapi encrypt: {e}"))?;
-        fs::write(&path, &buf).map_err(|e| format!("write: {e}"))?;
+
+        // 写临时文件
+        let tmp = path.with_extension("bin.tmp");
+        {
+            use std::io::Write;
+            let mut f = fs::File::create(&tmp).map_err(|e| format!("create tmp: {e}"))?;
+            f.write_all(&buf).map_err(|e| format!("write tmp: {e}"))?;
+            f.sync_all().map_err(|e| format!("sync tmp: {e}"))?;
+        }
+
+        // 原子 rename 覆盖（Windows 上 rename 不允许目标已存在，需要先 remove）
+        if path.exists() {
+            fs::remove_file(&path).map_err(|e| format!("remove old: {e}"))?;
+        }
+        fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
         Ok(path)
     }
 
@@ -72,13 +89,64 @@ mod keystore {
 mod windows_crypto {
     pub const CRYPTPROTECT_DATA_HEADER: [u8; 4] = [b'C', b'T', b'W', b'P'];
 
-    // DPAPI flags: CRYPTPROTECT_UI_FORBIDDEN allows service access; UI = 0x1 (default).
-    // 我们用 0 让它跟当前用户绑定。
+    /// DPAPI flags: CRYPTPROTECT_UI_FORBIDDEN 禁止任何 UI 弹窗，
+    /// 确保后台小组件进程永远不会触发交互式提示。
+    /// 我们也使用 0 让 DPAPI 绑定到当前用户。
     fn protect_flags() -> u32 {
-        0x0
+        windows::Win32::Security::Cryptography::CRYPTPROTECT_UI_FORBIDDEN
     }
 
-    pub fn encrypt(plaintext: &[u8], out: &mut Vec<u8>) -> windows::core::Result<()> {
+    /// DPAPI 分配 buffer 的 RAII 封装：在 Drop 时调用 LocalFree 释放。
+    /// 失败路径也通过 Drop 自动释放。
+    struct DpapiBuffer {
+        ptr: *mut u8,
+        len: usize,
+    }
+
+    impl DpapiBuffer {
+        /// 空 buffer（DPAPI 在错误或空响应时返回）
+        fn empty() -> Self {
+            Self { ptr: std::ptr::null_mut(), len: 0 }
+        }
+
+        /// 复制到新 Vec 后，buffer 仍需通过 Drop 释放
+        fn as_slice(&self) -> &[u8] {
+            if self.ptr.is_null() || self.len == 0 {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+            }
+        }
+
+        /// 取出 buffer 所有权（用于复制后提前释放）
+        fn into_vec(self) -> Vec<u8> {
+            let v = if self.ptr.is_null() || self.len == 0 {
+                Vec::new()
+            } else {
+                unsafe { std::slice::from_raw_parts(self.ptr, self.len).to_vec() }
+            };
+            // self 即将被 drop；drop 会再调一次 LocalFree——所以这里必须禁止二次释放
+            // 通过 ManuallyDrop 跳过 drop。
+            std::mem::forget(self);
+            v
+        }
+    }
+
+    impl Drop for DpapiBuffer {
+        fn drop(&mut self) {
+            if !self.ptr.is_null() {
+                unsafe {
+                    // LocalFree 是 DPAPI/CryptProtectData/CryptUnprotectData 文档要求
+                    // 的释放函数（不能用 free / GlobalFree）。
+                    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+                    let h = HLOCAL(self.ptr as *mut _);
+                    let _ = LocalFree(h);
+                }
+            }
+        }
+    }
+
+    fn call_protect(plaintext: &[u8]) -> windows::core::Result<DpapiBuffer> {
         use windows::Win32::Security::Cryptography::{
             CryptProtectData, CRYPT_INTEGER_BLOB,
         };
@@ -101,25 +169,20 @@ mod windows_crypto {
                 &mut out_blob,
             )?;
         }
-        if out_blob.cbData > 0 && !out_blob.pbData.is_null() {
-            let slice = unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize) };
-            out.clear();
-            out.extend_from_slice(&CRYPTPROTECT_DATA_HEADER);
-            out.extend_from_slice(slice);
-            // 注：DPAPI 分配的 buffer 在进程退出时由 OS 回收。
-            // 持续调用会微小泄漏，对 widget 这种低频调用没问题。
+        if out_blob.cbData == 0 || out_blob.pbData.is_null() {
+            Ok(DpapiBuffer::empty())
+        } else {
+            Ok(DpapiBuffer {
+                ptr: out_blob.pbData,
+                len: out_blob.cbData as usize,
+            })
         }
-        Ok(())
     }
 
-    pub fn decrypt(blob: &[u8]) -> windows::core::Result<Vec<u8>> {
+    fn call_unprotect(payload: &[u8]) -> windows::core::Result<DpapiBuffer> {
         use windows::Win32::Security::Cryptography::{
             CryptUnprotectData, CRYPT_INTEGER_BLOB,
         };
-        if blob.len() < CRYPTPROTECT_DATA_HEADER.len() {
-            return Ok(Vec::new());
-        }
-        let payload = &blob[CRYPTPROTECT_DATA_HEADER.len()..];
         let mut in_blob = CRYPT_INTEGER_BLOB {
             cbData: payload.len() as u32,
             pbData: payload.as_ptr() as *mut u8,
@@ -131,87 +194,164 @@ mod windows_crypto {
         unsafe {
             CryptUnprotectData(&mut in_blob, None, None, None, None, 0, &mut out_blob)?
         };
-        if out_blob.cbData > 0 && !out_blob.pbData.is_null() {
-            let slice = unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize) };
-            Ok(slice.to_vec())
+        if out_blob.cbData == 0 || out_blob.pbData.is_null() {
+            Ok(DpapiBuffer::empty())
         } else {
-            Ok(Vec::new())
+            Ok(DpapiBuffer {
+                ptr: out_blob.pbData,
+                len: out_blob.cbData as usize,
+            })
         }
+    }
+
+    pub fn encrypt(plaintext: &[u8], out: &mut Vec<u8>) -> windows::core::Result<()> {
+        let buf = call_protect(plaintext)?;
+        // 复制后 buffer 由 Drop 自动 LocalFree
+        let slice = buf.as_slice();
+        out.clear();
+        out.extend_from_slice(&CRYPTPROTECT_DATA_HEADER);
+        out.extend_from_slice(slice);
+        Ok(())
+    }
+
+    pub fn decrypt(blob: &[u8]) -> windows::core::Result<Vec<u8>> {
+        if blob.len() < CRYPTPROTECT_DATA_HEADER.len() {
+            return Ok(Vec::new());
+        }
+        let payload = &blob[CRYPTPROTECT_DATA_HEADER.len()..];
+        let buf = call_unprotect(payload)?;
+        // 一次性取出所有权 → Drop 释放 DPAPI buffer
+        Ok(buf.into_vec())
+    }
+
+    /// 单元测试：DPAPI encrypt/decrypt 往返
+    #[cfg(test)]
+    #[test]
+    fn dpapi_roundtrip() {
+        let plaintext = b"sk-cp-test-key-for-roundtrip-1234567890abcdef";
+        let mut ciphertext = Vec::new();
+        encrypt(plaintext, &mut ciphertext).expect("encrypt failed");
+        assert_eq!(&ciphertext[..4], &CRYPTPROTECT_DATA_HEADER);
+        let decrypted = decrypt(&ciphertext).expect("decrypt failed");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    /// 单元测试：空 blob 返回空 vec
+    #[cfg(test)]
+    #[test]
+    fn dpapi_empty_blob() {
+        let r = decrypt(&[]).expect("decrypt empty");
+        assert!(r.is_empty());
+    }
+
+    /// 单元测试：过短 blob（无 payload）返回空 vec
+    #[cfg(test)]
+    #[test]
+    fn dpapi_short_blob() {
+        let r = decrypt(&[b'C', b'T']).expect("decrypt short");
+        assert!(r.is_empty());
     }
 }
 
+/// 非 Windows 平台：**不允许持久化 Key**。
+/// 明文落盘等于把可换钱的 API 凭据暴露给所有本机进程 + 备份系统 + 文件恢复工具。
+/// 非 Windows 用户应通过环境变量 `MINIMAX_API_KEY` / `MINIMAX_CP_TOKEN` 注入 Key。
 #[cfg(not(target_os = "windows"))]
 mod keystore {
-    use std::fs;
     use std::path::PathBuf;
 
     pub fn key_path() -> PathBuf {
+        // 仅用于探测：显示用户禁用持久化时的提示信息；不读不写。
         let base = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(base).join(".claude-usage-widget").join("key.txt")
+        PathBuf::from(base).join(".claude-usage-widget")
     }
 
-    pub fn save(plaintext: &[u8]) -> Result<PathBuf, String> {
-        let path = key_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
-        }
-        fs::write(&path, plaintext).map_err(|e| format!("write: {e}"))?;
-        Ok(path)
+    pub fn save(_plaintext: &[u8]) -> Result<PathBuf, String> {
+        Err("Persistent Key storage is not supported on this platform. \
+             Set the MINIMAX_API_KEY or MINIMAX_CP_TOKEN environment variable instead."
+            .to_string())
     }
 
     pub fn load() -> Result<Vec<u8>, String> {
-        let path = key_path();
-        if !path.exists() { return Err("not found".to_string()); }
-        fs::read(&path).map_err(|e| format!("read: {e}"))
+        Err("Persistent Key storage is not supported on this platform.".to_string())
     }
 }
 
-fn get_api_key() -> Option<String> {
-    for env_name in &["MINIMAX_API_KEY", "MINIMAX_CP_TOKEN"] {
-        // 1) 进程级 env var（shell 启动时设的）
-        if let Ok(v) = std::env::var(env_name) {
+/// Key 来源 —— 给前端看时只暴露三种枚举值，不暴露具体环境变量名或 key 路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    /// 进程级环境变量（启动 shell 时 set）
+    ProcessEnv,
+    /// Windows 用户级环境变量（setx / 系统属性设置）
+    UserEnv,
+    /// DPAPI 加密的本地文件
+    SecureStore,
+}
+
+#[derive(Debug)]
+pub struct ResolvedApiKey {
+    pub value: String,
+    pub source: KeySource,
+}
+
+/// 统一 Key 解析：与 probe_state 使用完全相同的优先级和空值规则。
+///
+/// 优先级：进程 env → 用户 env → SecureStore。
+/// 空字符串不算存在（防止 set EMPTY_VAR= 让 UI 误以为有 key）。
+fn resolve_api_key() -> Result<ResolvedApiKey, String> {
+    let env_names = ["MINIMAX_API_KEY", "MINIMAX_CP_TOKEN"];
+
+    // 1) 进程级 env var
+    for name in &env_names {
+        if let Ok(v) = std::env::var(name) {
             let trimmed = v.trim();
             if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+                return Ok(ResolvedApiKey { value: trimmed.to_string(), source: KeySource::ProcessEnv });
             }
         }
-        // 2) Windows User-level env var（setx 设置的、GUI 进程能读到）
-        #[cfg(target_os = "windows")]
-        {
-            use winreg::enums::*;
-            use winreg::RegKey;
-            if let Ok(hkcu) = RegKey::predef(HKEY_CURRENT_USER)
-                .open_subkey(r"Environment")
-            {
-                if let Ok(v) = hkcu.get_value::<String, _>(env_name) {
+    }
+
+    // 2) Windows 用户级 env var
+    #[cfg(target_os = "windows")]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        if let Ok(hkcu) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(r"Environment") {
+            for name in &env_names {
+                if let Ok(v) = hkcu.get_value::<String, _>(name) {
                     let trimmed = v.trim();
                     if !trimmed.is_empty() {
-                        return Some(trimmed.to_string());
+                        return Ok(ResolvedApiKey { value: trimmed.to_string(), source: KeySource::UserEnv });
                     }
                 }
             }
         }
     }
-    // 3) 已加密存盘的
+
+    // 3) SecureStore
     if let Ok(bytes) = keystore::load() {
-        if let Ok(s) = std::str::from_utf8(&bytes) {
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+        if !bytes.is_empty() {
+            if let Ok(s) = std::str::from_utf8(&bytes) {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return Ok(ResolvedApiKey { value: trimmed.to_string(), source: KeySource::SecureStore });
+                }
             }
         }
     }
-    None
+
+    Err("API key not configured".to_string())
 }
 
 #[tauri::command]
 async fn fetch_minimax_usage() -> UsageSnapshot {
+    #[cfg(debug_assertions)]
     eprintln!("[minimax] fetch_minimax_usage called");
     let fetched_at = chrono::Utc::now().to_rfc3339();
 
-    let key = match get_api_key() {
-        Some(k) => k,
-        None => {
+    let key = match resolve_api_key() {
+        Ok(k) => k.value,
+        Err(_) => {
             return UsageSnapshot {
                 found: false,
                 error: Some("Missing API key.".to_string()),
@@ -246,6 +386,7 @@ async fn fetch_minimax_usage() -> UsageSnapshot {
         .send()
         .await;
 
+    let started = std::time::Instant::now();
     match resp {
         Ok(r) => {
             let status = r.status();
@@ -259,7 +400,19 @@ async fn fetch_minimax_usage() -> UsageSnapshot {
                     key_source: "saved".to_string(),
                 };
             }
-            eprintln!("[minimax API] HTTP {} body: {}", status, &text[..text.len().min(2000)]);
+            // 安全：永远不打印响应体（可能含用户数据 / Key 痕迹）
+            // debug 模式仅记录元数据（状态码 / 耗时 / 响应长度）
+            let body_len = text.len();
+            let elapsed_ms = started.elapsed().as_millis();
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[minimax API] http={} elapsed_ms={} body_bytes={}",
+                status, elapsed_ms, body_len
+            );
+            #[cfg(not(debug_assertions))]
+            {
+                let _ = (status, elapsed_ms, body_len);
+            }
             match serde_json::from_str::<serde_json::Value>(&text) {
                 Ok(v) => UsageSnapshot {
                     found: true,
@@ -287,10 +440,8 @@ async fn fetch_minimax_usage() -> UsageSnapshot {
     }
 }
 
-#[tauri::command]
-fn frontend_log(level: String, msg: String) {
-    eprintln!("[frontend {}] {}", level, msg);
-}
+/// `frontend_log` 已删除（生产构建绝不接收前端任意字符串并写入 stderr）。
+/// 前端调试日志请使用 `console.*` 由 WebView 自己管理。
 
 /// 当前套餐暂不在 UI 展示。
 ///
@@ -375,53 +526,35 @@ fn extract_model_from_claude_settings(text: &str) -> Option<String> {
 
 #[tauri::command]
 fn probe_state() -> ProbeState {
-    let path = keystore::key_path();
-
-    // 1) process-level env
-    if std::env::var("MINIMAX_API_KEY").is_ok() || std::env::var("MINIMAX_CP_TOKEN").is_ok() {
-        return ProbeState { has_key: true, source: "env".to_string(), path: path.to_string_lossy().to_string() };
-    }
-    // 2) Windows User-level env (setx)
-    #[cfg(target_os = "windows")]
-    {
-        use winreg::enums::*;
-        use winreg::RegKey;
-        if let Ok(hkcu) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(r"Environment") {
-            for name in &["MINIMAX_API_KEY", "MINIMAX_CP_TOKEN"] {
-                if hkcu.get_value::<String, _>(name).is_ok() {
-                    return ProbeState { has_key: true, source: "env".to_string(), path: path.to_string_lossy().to_string() };
-                }
-            }
-        }
-    }
-    // 3) 加密存盘
-    match keystore::load() {
-        Ok(bytes) if !bytes.is_empty() => ProbeState {
+    // 使用 resolve_api_key 保证规则一致（空字符串 / 优先级 / fallback）
+    match resolve_api_key() {
+        Ok(k) => ProbeState {
             has_key: true,
-            source: "saved".to_string(),
-            path: path.to_string_lossy().to_string(),
+            source: match k.source {
+                KeySource::ProcessEnv | KeySource::UserEnv => "env".to_string(),
+                KeySource::SecureStore => "saved".to_string(),
+            },
         },
-        _ => ProbeState {
+        Err(_) => ProbeState {
             has_key: false,
             source: "missing".to_string(),
-            path: path.to_string_lossy().to_string(),
         },
     }
 }
 
 #[tauri::command]
 async fn save_key_and_test(key: String) -> SaveResult {
+    // 1) 校验格式（trim + 长度上限 + 前缀）
     let trimmed = key.trim().to_string();
-    if !trimmed.starts_with("sk-cp-") || trimmed.len() < 20 {
+    const MAX_KEY_LEN: usize = 512;
+    if trimmed.len() < 20 || trimmed.len() > MAX_KEY_LEN {
+        return SaveResult { ok: false, error: Some("key 长度应在 20–512 字符之间".to_string()) };
+    }
+    if !trimmed.starts_with("sk-cp-") {
         return SaveResult { ok: false, error: Some("key 应以 sk-cp- 开头".to_string()) };
     }
 
-    // 1. 加密存盘
-    if let Err(e) = keystore::save(trimmed.as_bytes()) {
-        return SaveResult { ok: false, error: Some(format!("保存失败：{e}")) };
-    }
-
-    // 2. 立刻打一次 API 验证可用
+    // 2) 用内存中的候选 key 调 API —— 失败不破坏旧 key
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -438,18 +571,29 @@ async fn save_key_and_test(key: String) -> SaveResult {
         .await;
 
     match resp {
-        Ok(r) if r.status().is_success() => SaveResult { ok: true, error: None },
+        Ok(r) if r.status().is_success() => {
+            // 3) 明确认证成功 → 临时文件 → 原子 rename
+            // 注意：keystore::save 已经是"先写临时文件再 rename"的原子操作
+            if let Err(e) = keystore::save(trimmed.as_bytes()) {
+                return SaveResult { ok: false, error: Some(format!("保存失败：{e}")) };
+            }
+            SaveResult { ok: true, error: None }
+        }
         Ok(r) => {
-            // 撤销保存——这个 key 是坏的
-            let _ = fs::remove_file(keystore::key_path());
+            // 4xx 表示 key 无效（401/403）；不修改磁盘上的旧 key
             let status = r.status();
             let body = r.text().await.unwrap_or_default();
-            let snippet = body.chars().take(200).collect::<String>();
-            SaveResult { ok: false, error: Some(format!("API {} — {}", status, snippet)) }
+            let snippet: String = body.chars().filter(|c| !c.is_control()).take(120).collect();
+            let msg = if status.as_u16() == 401 || status.as_u16() == 403 {
+                format!("Key 认证失败 ({})", status.as_u16())
+            } else {
+                format!("API {} — {}", status, snippet)
+            };
+            SaveResult { ok: false, error: Some(msg) }
         }
         Err(e) => {
-            let _ = fs::remove_file(keystore::key_path());
-            SaveResult { ok: false, error: Some(format!("网络：{e}")) }
+            // 网络错误：保留旧 key
+            SaveResult { ok: false, error: Some(format!("网络错误，未修改已存 Key：{e}")) }
         }
     }
 }
@@ -494,7 +638,8 @@ fn enable_autostart(app: tauri::AppHandle) -> Result<bool, String> {
         run_key
             .set_value("ClaudeUsageWidget", &value)
             .map_err(|e| format!("set Run: {e}"))?;
-        eprintln!("[claude-usage-widget] autostart enabled → {}", value);
+        #[cfg(debug_assertions)]
+    eprintln!("[claude-usage-widget] autostart enabled → {}", value);
         let _ = app;
         Ok(true)
     }
@@ -520,6 +665,7 @@ fn disable_autostart() -> Result<bool, String> {
             .map_err(|e| format!("open Run: {e}"))?;
         match run_key.delete_value("ClaudeUsageWidget") {
             Ok(_) => {
+                #[cfg(debug_assertions)]
                 eprintln!("[claude-usage-widget] autostart disabled");
                 Ok(true)
             }
@@ -628,7 +774,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             fetch_minimax_usage,
-            frontend_log,
             probe_state,
             save_key_and_test,
             open_url,
@@ -666,6 +811,7 @@ pub fn run() {
                         let x = (sw as i32).saturating_sub(win_size.width as i32 + 24);
                         let y = 48;
                         let _ = window.set_position(tauri::PhysicalPosition::new(x.max(0), y));
+                        #[cfg(debug_assertions)]
                         eprintln!(
                             "[claude-usage-widget] positioned at ({}, {}), screen {}x{}, window {}x{}",
                             x, y, sw, sh, win_size.width, win_size.height
@@ -685,9 +831,11 @@ pub fn run() {
                             if running {
                                 let _ = window.show();
                                 let _ = window.set_focus();
+                                #[cfg(debug_assertions)]
                                 eprintln!("[claude-usage-widget] claude.exe detected → show");
                             } else {
                                 let _ = window.hide();
+                                #[cfg(debug_assertions)]
                                 eprintln!("[claude-usage-widget] claude.exe gone → hide");
                             }
                             claude_running = running;

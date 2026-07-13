@@ -7,8 +7,9 @@ try {
   document.body.innerHTML += '<pre style="color:red;padding:8px;font-size:10px">[FE_TOP_ERR] ' + e.message + '</pre>';
 }
 const tlog = (level, msg) => {
-  if (invoke) invoke("frontend_log", { level, msg }).catch(() => {});
-  console[level === "info" ? "log" : level]("[FE]", msg);
+  // 仅写入 WebView 控制台。生产构建绝不发送任意字符串到 Rust stderr。
+  const fn = console[level === "info" ? "log" : level] || console.log;
+  fn.call(console, "[FE]", msg);
 };
 tlog("info", "main.js loaded, window=" + (getCurrentWindow ? "ok" : "MISSING"));
 tlog("info", "readyState=" + document.readyState + ", has-setup-overlay=" + !!document.getElementById("setup-overlay"));
