@@ -774,13 +774,6 @@ fn claude_code_running() -> bool {
     is_claude_code_running()
 }
 
-#[tauri::command]
-fn set_autohide(_enabled: bool) {
-    // 前端 toggle 标记。简化：当前实现忽略此参数（永远检测）。
-    // 留接口以便未来实现"用户暂时关掉自动联动"。
-    let _ = _enabled;
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -791,7 +784,6 @@ pub fn run() {
             open_minimax_key_page,
             clear_key,
             claude_code_running,
-            set_autohide,
             enable_autostart,
             disable_autostart,
             is_autostart_enabled,
@@ -800,23 +792,33 @@ pub fn run() {
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
-                // 默认隐藏。Claude Code 在跑时，后台线程会把它 show 出来；
-                // Claude Code 关掉 → 隐藏。widget 永远不"独立"显示。
-                let _ = window.hide();
-                let _ = window.unminimize();
+                // 决定初始可见性：
+                //   - 无 Key：首次安装用户必须能直接看到配置向导
+                //   - 有 Key + Claude 未运行：默认隐藏
+                //   - 有 Key + Claude 运行：直接显示
+                let stored_key_present = keystore::load().map(|b| !b.is_empty()).unwrap_or(false);
+                let env_key_present = ["MINIMAX_API_KEY", "MINIMAX_CP_TOKEN"]
+                    .iter()
+                    .any(|n| std::env::var(n).map(|v| !v.trim().is_empty()).unwrap_or(false));
+                let has_key = stored_key_present || env_key_present;
 
-                let monitor_size: Option<(u32, u32)> = window
+                if has_key && is_claude_code_running() {
+                    let _ = window.show();
+                } else if !has_key {
+                    let _ = window.show();
+                } else {
+                    let _ = window.hide();
+                    let _ = window.unminimize();
+                }
+
+                let monitor_size = window
                     .primary_monitor()
                     .ok()
                     .flatten()
-                    .map(|m| {
-                        let s = m.size();
-                        (s.width, s.height)
-                    });
-
+                    .map(|m| (m.size().width, m.size().height));
                 let win_size = window
                     .inner_size()
-                    .unwrap_or(tauri::PhysicalSize::new(280, 200));
+                    .unwrap_or(tauri::PhysicalSize::new(360, 230));
 
                 if let Some((sw, sh)) = monitor_size {
                     if sw > 0 && sh > 0 && win_size.width > 0 && win_size.height > 0 {
@@ -831,20 +833,19 @@ pub fn run() {
                     }
                 }
 
-                // 启动后台线程：每 5s 检查 Claude Code 进程是否在跑
-                // 在 → show 窗口；不在 → hide
+                // 后台线程：每 10s 检查 Claude Code 进程（5s → 10s 减半 CPU）
+                // 状态改变时 emit；用户手动隐藏后不抢焦点（不调用 set_focus）
                 std::thread::spawn({
                     let window = window.clone();
                     let mut claude_running = false;
                     move || loop {
-                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        std::thread::sleep(std::time::Duration::from_secs(10));
                         let running = is_claude_code_running();
                         if running != claude_running {
                             if running {
                                 let _ = window.show();
-                                let _ = window.set_focus();
                                 #[cfg(debug_assertions)]
-                                eprintln!("[claude-usage-widget] claude.exe detected → show");
+                                eprintln!("[claude-usage-widget] claude.exe detected → show (no focus steal)");
                             } else {
                                 let _ = window.hide();
                                 #[cfg(debug_assertions)]
