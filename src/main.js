@@ -25,10 +25,10 @@ tlog("info", "readyState=" + document.readyState + ", has-setup-overlay=" + !!do
 const REFRESH_MS = 30000; // 30s 远程拉一次（API 限速）
 const TZ = "Asia/Shanghai";
 
-// ─── 工具 ──────────────────────────────────────────────
-function escapeHtml(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+// ─── 工具（纯函数，可被 Node test 直接 import） ────────
+export function escapeHtml(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
-function fmtDuration(ms) {
+export function fmtDuration(ms) {
   if (ms == null || ms <= 0) return "—";
   // API 给的就是毫秒
   const totalSec = Math.floor(ms / 1000);
@@ -89,7 +89,7 @@ function updateRefreshTooltip() {
 
 // 上次更新独立 meta-row 文本生成。
 // 同一天：`HH:mm:ss`；跨天：`昨天 HH:mm:ss` 或 `MM-DD HH:mm:ss`（更早）。
-function formatLastUpdated(date) {
+export function formatLastUpdated(date, tz = TZ) {
   if (!date) return "--";
   const now = new Date();
   const sameDay = date.toDateString() === now.toDateString();
@@ -97,7 +97,7 @@ function formatLastUpdated(date) {
   yesterday.setDate(now.getDate() - 1);
   const isYesterday = date.toDateString() === yesterday.toDateString();
   const hh = date.toLocaleTimeString("zh-CN", {
-    hour: "2-digit", minute: "2-digit", second: "2-digit", timeZone: TZ, hour12: false,
+    hour: "2-digit", minute: "2-digit", second: "2-digit", timeZone: tz, hour12: false,
   });
   if (sameDay) return hh;
   if (isYesterday) return `昨天 ${hh}`;
