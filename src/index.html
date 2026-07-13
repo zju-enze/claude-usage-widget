@@ -10,11 +10,33 @@
     <div id="widget" data-tauri-drag-region>
 
       <header data-tauri-drag-region>
-        <span class="title" data-tauri-drag-region>Claude Usage</span>
+        <div class="title" data-tauri-drag-region>
+          <span class="app-icon" data-tauri-drag-region aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 2 L4 6 L4 14 C4 18 7.5 21 12 22 C16.5 21 20 18 20 14 L20 6 Z" />
+            </svg>
+          </span>
+          <span class="dot state-idle" id="status-dot" data-tauri-drag-region aria-hidden="true"></span>
+          <span class="title-text" data-tauri-drag-region>Claude Usage</span>
+        </div>
         <div class="header-actions">
-          <button id="btn-refresh" title="刷新">⟳</button>
-          <button id="btn-collapse" title="折叠/展开">−</button>
-          <button id="btn-close" title="关闭">×</button>
+          <button id="btn-refresh" class="icon-btn" type="button" title="刷新" aria-label="刷新">
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 12a9 9 0 1 1-3-6.7" />
+              <polyline points="21 4 21 10 15 10" />
+            </svg>
+          </button>
+          <button id="btn-collapse" class="icon-btn" type="button" title="折叠 / 展开" aria-label="折叠 / 展开">
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+          </button>
+          <button id="btn-close" class="icon-btn icon-btn-close" type="button" title="关闭" aria-label="关闭">
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+              <line x1="6" y1="6" x2="18" y2="18" />
+              <line x1="18" y1="6" x2="6" y2="18" />
+            </svg>
+          </button>
         </div>
       </header>
 
@@ -22,10 +44,12 @@
         <section class="bar-block" id="block-5h">
           <div class="bar-label">
             <span class="left">5 小时</span>
-            <span class="right" id="fiveHour-pct">—</span>
+            <span class="right"><span class="pct-tag" id="fiveHour-pct">—</span></span>
           </div>
           <div class="bar-bg">
-            <div class="bar-fill" id="fiveHour-fill" style="width:0%"></div>
+            <div class="bar-fill" id="fiveHour-fill" style="width:0%">
+              <span class="bar-fill-gloss"></span>
+            </div>
           </div>
           <div class="bar-sub" id="fiveHour-resets">—</div>
         </section>
@@ -33,16 +57,19 @@
         <section class="bar-block" id="block-7d">
           <div class="bar-label">
             <span class="left">7 天</span>
-            <span class="right" id="sevenDay-pct">—</span>
+            <span class="right"><span class="pct-tag" id="sevenDay-pct">—</span></span>
           </div>
           <div class="bar-bg">
-            <div class="bar-fill" id="sevenDay-fill" style="width:0%"></div>
+            <div class="bar-fill" id="sevenDay-fill" style="width:0%">
+              <span class="bar-fill-gloss"></span>
+            </div>
           </div>
           <div class="bar-sub" id="sevenDay-resets">—</div>
         </section>
 
-        <div id="model-block">
-          模型 <span class="mname" id="model-name">—</span>
+        <div class="model-row-bottom" id="model-block">
+          <span class="model-row-label">当前模型</span>
+          <span class="model-pill" id="model-name" title="">—</span>
         </div>
 
         <details id="block-models">

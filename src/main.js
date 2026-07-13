@@ -57,6 +57,14 @@ function setStatus(msg, isErr) {
   el.classList.toggle("dim", !!isErr);
 }
 
+function setConnectionState(state) {
+  // state: "idle" | "loading" | "ok" | "warn" | "error"
+  const dot = document.getElementById("status-dot");
+  if (!dot) return;
+  dot.classList.remove("state-idle", "state-loading", "state-ok", "state-warn", "state-error");
+  dot.classList.add("state-" + state);
+}
+
 // ─── 单条进度条 ──────────────────────────────────────────
 // 颜色：已用 ≤70% 绿、70–90% 黄、>90% 红
 function paintBar(fillId, pctId, subId, usedPct, resetMs, subText) {
@@ -72,6 +80,7 @@ function paintBar(fillId, pctId, subId, usedPct, resetMs, subText) {
     return;
   }
   const v = Math.max(0, Math.min(100, Number(usedPct)));
+  const prev = fillEl.style.width;
   fillEl.style.width = `${v}%`;
   fillEl.className = "bar-fill " + (
     v >= 90 ? "bad" : v >= 70 ? "warn" : "good"
@@ -82,6 +91,12 @@ function paintBar(fillId, pctId, subId, usedPct, resetMs, subText) {
   if (subEl && resetMs != null) {
     const r = fmtDuration(resetMs);
     if (r !== "—") subEl.textContent = `${subText || ""} · 重置 ${r}`.replace(/^\s·\s/, "");
+  }
+  // 仅在宽度变化时触发一次性光泽滑过
+  if (prev && prev !== `${v}%`) {
+    fillEl.classList.remove("is-shine");
+    void fillEl.offsetWidth;
+    fillEl.classList.add("is-shine");
   }
 }
 
@@ -114,14 +129,17 @@ function renderModels(list) {
 // ─── 主刷新 ──────────────────────────────────────────────
 async function refresh() {
   try {
+    setConnectionState("loading");
     const snap = await invoke("fetch_minimax_usage");
     if (!snap.found) {
       setStatus(snap.error || "读取失败", true);
+      setConnectionState("error");
       return;
     }
     const arr = snap.raw?.model_remains;
     if (!Array.isArray(arr) || arr.length === 0) {
       setStatus("API 返回无 model_remains", true);
+      setConnectionState("error");
       return;
     }
 
@@ -157,7 +175,8 @@ async function refresh() {
     );
 
     document.getElementById("model-name").textContent = primary.model_name || "?";
-    document.getElementById("model-block").style.display = "block";
+    document.getElementById("model-name").setAttribute("title", primary.model_name || "");
+    document.getElementById("model-block").style.display = "flex";
 
     renderModels(arr);
 
@@ -165,22 +184,40 @@ async function refresh() {
       hour: "2-digit", minute: "2-digit", second: "2-digit", timeZone: TZ, hour12: false,
     });
     setStatus(`${snap.key_source === "missing" ? "no-key" : "env"} · ${ts}`, false);
+    setConnectionState("ok");
   } catch (e) {
     setStatus(`读失败: ${e}`, true);
+    setConnectionState("error");
   }
 }
 
 function setupButtons() {
   const win = getCurrentWindow();
-  document.getElementById("btn-refresh").addEventListener("click", (e) => { e.stopPropagation(); refresh(); });
+  const refreshBtn = document.getElementById("btn-refresh");
+  refreshBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (refreshBtn.classList.contains("is-spinning")) return;
+    refreshBtn.classList.add("is-spinning");
+    setConnectionState("loading");
+    const p = refresh();
+    const restore = () => refreshBtn.classList.remove("is-spinning");
+    if (p && typeof p.then === "function") {
+      p.finally(restore);
+    } else {
+      setTimeout(restore, 800);
+    }
+  });
 
   document.getElementById("btn-collapse").addEventListener("click", async (e) => {
     e.stopPropagation();
     const w = document.getElementById("widget");
     const collapsed = w.classList.toggle("collapsed");
-    document.getElementById("btn-collapse").textContent = collapsed ? "+" : "−";
+    const icon = document.querySelector("#btn-collapse svg");
+    if (icon) {
+      icon.style.transform = collapsed ? "rotate(45deg)" : "rotate(0deg)";
+    }
     try {
-      await win.setSize(new (win.constructor || Object).Size(280, collapsed ? 36 : 220));
+      await win.setSize(new (win.constructor || Object).Size(360, collapsed ? 44 : 268));
     } catch {}
   });
 
@@ -276,6 +313,7 @@ async function init() {
     tlog("info", "init: setupButtons done");
     setupSetupHandlers();
     tlog("info", "init: setupSetupHandlers done, calling probe_state");
+    setConnectionState("idle");
     const probeResult = await probe();
     tlog("info", "init: probe_state returned " + JSON.stringify(probeResult));
     if (!probeResult.has_key) {
