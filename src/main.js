@@ -175,66 +175,39 @@ async function loadActiveModel() {
 // ─── 主刷新 ──────────────────────────────────────────────
 //
 // 数据来源与处理边界：
-//   - 5h / 7d 用量：来自 coding_plan/remains 的 model_remains[0]
-//     （primary = current_interval_status === 1，否则取第一条）
-//   - 当前模型：来自 read_active_model（环境变量 / Claude Code 配置），
-//     不再从 model_remains[].model_name 推断
-//   - 套餐：来自 read_plan_metadata（API 不返回套餐名，硬编码显示）
-//   - 各模型剩余 %：API 字段存在但本组件不再进入 ViewModel
+//   - 5h / 7d 用量：来自后端 UsageViewModel.five_hour / .weekly
+//     （后端已校验字段范围、丢弃无效值，不再直接暴露 API 原始结构）
+//   - 当前模型：来自 read_active_model（环境变量 / Claude Code 配置）
+//   - 套餐：来自 read_plan_metadata（API 不返回套餐名，本组件不展示）
+//   - 各模型剩余 %：API 字段存在但被后端丢弃，前端永不接收
 async function refresh() {
   if (_refreshInFlight) return;
   _refreshInFlight = true;
   setConnectionState("loading");
   try {
-    const snap = await invoke("fetch_minimax_usage");
-    if (!snap.found) {
-      _refreshFailed = true;
-      setConnectionState("error");
-      updateRefreshTooltip();
-      return;
-    }
-    const arr = snap.raw?.model_remains;
-    if (!Array.isArray(arr) || arr.length === 0) {
+    const vm = await invoke("fetch_minimax_usage");
+    if (!vm.found || vm.state !== "ok") {
       _refreshFailed = true;
       setConnectionState("error");
       updateRefreshTooltip();
       return;
     }
 
-    // primary 仅用于 5h / 7d 字段解析（接口里 status===1 表示主档）
-    const primary = arr.find(x => x.current_interval_status === 1) || arr[0];
-
-    // `start_time`/`end_time` 是毫秒级 Unix 时间戳；`remains_time` 是毫秒数。
-    function used(remaining) {
-      if (remaining == null) return null;
-      const v = Number(remaining);
-      // 直接用：API 返回 0–100 整数（已用% = 100 - 剩余%）
-      return Math.max(0, Math.min(100, 100 - v));
-    }
-
-    const fiveRem = primary.current_interval_remaining_percent;
-    const weekRem = primary.current_weekly_remaining_percent;
-    const fiveResetsMs = Number(primary.remains_time) || 0;
-    const weekResetsMs = Number(primary.weekly_remains_time) || 0;
-    const startMs = Number(primary.start_time);
-    const endMs   = Number(primary.end_time);
-
+    // 后端已校验 0..=100 范围 + NaN/Infinity 过滤
     paintBar(
       "fiveHour-fill", "fiveHour-pct", "fiveHour-resets",
-      used(fiveRem),
-      fiveResetsMs,
-      `${fmtTimeLocal(startMs)}–${fmtTimeLocal(endMs)}`,
+      vm.five_hour_used_percent,
+      vm.five_hour_reset_after_ms,
+      `${fmtTimeLocal(vm.five_hour_start_at_ms)}–${fmtTimeLocal(vm.five_hour_end_at_ms)}`,
     );
     paintBar(
       "sevenDay-fill", "sevenDay-pct", "sevenDay-resets",
-      used(weekRem),
-      weekResetsMs,
+      vm.weekly_used_percent,
+      vm.weekly_reset_after_ms,
       "本周",
     );
 
-    // 注意：不再写 #model-name（由 loadActiveModel 维护）
-
-    _lastUpdatedAt = new Date(snap.fetched_at);
+    _lastUpdatedAt = vm.fetched_at ? new Date(vm.fetched_at) : new Date();
     _refreshFailed = false;
     setConnectionState("ok");
     updateRefreshTooltip();

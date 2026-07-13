@@ -2,13 +2,78 @@ use std::fs;
 use serde::Serialize;
 use tauri::Manager;
 
+mod api;
+
 #[derive(Serialize)]
 struct UsageSnapshot {
+    /// 兼容旧前端：true 表示拿到了 view-model
     found: bool,
+    /// 用户可读的错误
     error: Option<String>,
-    raw: serde_json::Value,
+    /// 错误的简短分类（"network" / "invalid-key" / ...）—— 不含路径或 key
+    error_kind: Option<String>,
+    /// ViewModel 数据（5h/7d 窗口 + fetched_at + state）。
+    /// 已不含 model_remains / model_name / Authorization / key path。
+    five_hour_used_percent: Option<f64>,
+    five_hour_reset_after_ms: Option<i64>,
+    five_hour_start_at_ms: Option<i64>,
+    five_hour_end_at_ms: Option<i64>,
+    weekly_used_percent: Option<f64>,
+    weekly_reset_after_ms: Option<i64>,
+    weekly_start_at_ms: Option<i64>,
+    weekly_end_at_ms: Option<i64>,
     fetched_at: String,
+    state: String, // "ok" | "no_data"
+    /// 兼容旧字段："env" | "saved" | "missing"（不暴露具体变量名）
     key_source: String,
+}
+
+impl UsageSnapshot {
+    fn error(user_message: String, kind: &str) -> Self {
+        Self {
+            found: false,
+            error: Some(user_message),
+            error_kind: Some(kind.to_string()),
+            five_hour_used_percent: None,
+            five_hour_reset_after_ms: None,
+            five_hour_start_at_ms: None,
+            five_hour_end_at_ms: None,
+            weekly_used_percent: None,
+            weekly_reset_after_ms: None,
+            weekly_start_at_ms: None,
+            weekly_end_at_ms: None,
+            fetched_at: chrono::Utc::now().to_rfc3339(),
+            state: "no_data".into(),
+            key_source: "missing".into(),
+        }
+    }
+
+    fn from_view_model(vm: crate::api::UsageViewModel, source: &crate::KeySource) -> Self {
+        let state = match vm.state {
+            crate::api::UsageState::Ok => "ok",
+            crate::api::UsageState::NoData => "no_data",
+        };
+        let key_source = match source {
+            crate::KeySource::ProcessEnv | crate::KeySource::UserEnv => "env",
+            crate::KeySource::SecureStore => "saved",
+        };
+        Self {
+            found: true,
+            error: None,
+            error_kind: None,
+            five_hour_used_percent: vm.five_hour.used_percent,
+            five_hour_reset_after_ms: vm.five_hour.reset_after_ms,
+            five_hour_start_at_ms: vm.five_hour.start_at_ms,
+            five_hour_end_at_ms: vm.five_hour.end_at_ms,
+            weekly_used_percent: vm.weekly.used_percent,
+            weekly_reset_after_ms: vm.weekly.reset_after_ms,
+            weekly_start_at_ms: vm.weekly.start_at_ms,
+            weekly_end_at_ms: vm.weekly.end_at_ms,
+            fetched_at: vm.fetched_at,
+            state: state.into(),
+            key_source: key_source.into(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -345,98 +410,47 @@ fn resolve_api_key() -> Result<ResolvedApiKey, String> {
 
 #[tauri::command]
 async fn fetch_minimax_usage() -> UsageSnapshot {
-    #[cfg(debug_assertions)]
-    eprintln!("[minimax] fetch_minimax_usage called");
-    let fetched_at = chrono::Utc::now().to_rfc3339();
+    use crate::api::fetch_usage;
 
-    let key = match resolve_api_key() {
-        Ok(k) => k.value,
+    let resolved = match resolve_api_key() {
+        Ok(r) => r,
         Err(_) => {
-            return UsageSnapshot {
-                found: false,
-                error: Some("Missing API key.".to_string()),
-                raw: serde_json::json!({}),
-                fetched_at,
-                key_source: "missing".to_string(),
-            }
+            return UsageSnapshot::error("未配置 API Key".to_string(), "missing-key");
         }
     };
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return UsageSnapshot {
-                found: false,
-                error: Some(format!("client build: {e}")),
-                raw: serde_json::json!({}),
-                fetched_at,
-                key_source: "missing".to_string(),
-            }
-        }
-    };
+    // 共享 reqwest Client：每次调用都新建 client 等于 TLS 握手 + 连接池重建。
+    // 这里每次都新建是临时方案——阶段 9 会用 AppState 共享。
+    let client = crate::api::build_client();
 
-    let resp = client
-        .get("https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains")
-        .header("Authorization", format!("Bearer {key}"))
-        .header("referer", "https://platform.minimaxi.com/")
-        .header("Accept", "application/json")
-        .send()
-        .await;
-
-    let started = std::time::Instant::now();
-    match resp {
-        Ok(r) => {
-            let status = r.status();
-            let text = r.text().await.unwrap_or_default();
-            if !status.is_success() {
-                return UsageSnapshot {
-                    found: false,
-                    error: Some(format!("HTTP {} — {}", status, &text[..text.len().min(200)])),
-                    raw: serde_json::json!({}),
-                    fetched_at,
-                    key_source: "saved".to_string(),
-                };
-            }
-            // 安全：永远不打印响应体（可能含用户数据 / Key 痕迹）
-            // debug 模式仅记录元数据（状态码 / 耗时 / 响应长度）
-            let body_len = text.len();
-            let elapsed_ms = started.elapsed().as_millis();
+    let view_model = match fetch_usage(&client, &resolved.value).await {
+        Ok(vm) => vm,
+        Err(err) => {
             #[cfg(debug_assertions)]
             eprintln!(
-                "[minimax API] http={} elapsed_ms={} body_bytes={}",
-                status, elapsed_ms, body_len
+                "[minimax API] error kind={:?} retry_after={:?}",
+                err.kind, err.retry_after_seconds
             );
-            #[cfg(not(debug_assertions))]
-            {
-                let _ = (status, elapsed_ms, body_len);
-            }
-            match serde_json::from_str::<serde_json::Value>(&text) {
-                Ok(v) => UsageSnapshot {
-                    found: true,
-                    error: None,
-                    raw: v,
-                    fetched_at,
-                    key_source: "saved".to_string(),
-                },
-                Err(e) => UsageSnapshot {
-                    found: false,
-                    error: Some(format!("JSON parse: {e}")),
-                    raw: serde_json::json!({}),
-                    fetched_at,
-                    key_source: "saved".to_string(),
-                },
-            }
+            return UsageSnapshot::error(err.user_message, err_kind_label(err.kind));
         }
-        Err(e) => UsageSnapshot {
-            found: false,
-            error: Some(format!("network: {e}")),
-            raw: serde_json::json!({}),
-            fetched_at,
-            key_source: "saved".to_string(),
-        },
+    };
+
+    UsageSnapshot::from_view_model(view_model, &resolved.source)
+}
+
+/// 把 UsageErrorKind 映射到前端 tooltip 上能展示的简短类别标签。
+fn err_kind_label(k: crate::api::UsageErrorKind) -> &'static str {
+    use crate::api::UsageErrorKind;
+    match k {
+        UsageErrorKind::MissingKey => "missing-key",
+        UsageErrorKind::InvalidKey => "invalid-key",
+        UsageErrorKind::Forbidden => "forbidden",
+        UsageErrorKind::RateLimited => "rate-limited",
+        UsageErrorKind::Timeout => "timeout",
+        UsageErrorKind::Network => "network",
+        UsageErrorKind::Server => "server",
+        UsageErrorKind::InvalidResponse => "invalid-response",
+        UsageErrorKind::ResponseTooLarge => "response-too-large",
     }
 }
 
