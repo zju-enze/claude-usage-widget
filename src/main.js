@@ -192,12 +192,12 @@ async function refresh() {
   if (_refreshInFlight) return;
   _refreshInFlight = true;
   setConnectionState("loading");
+  updateRefreshTooltip();
   try {
     const vm = await invoke("fetch_minimax_usage");
     if (!vm.found || vm.state !== "ok") {
       _refreshFailed = true;
       setConnectionState("error");
-      updateRefreshTooltip();
       return;
     }
 
@@ -218,13 +218,14 @@ async function refresh() {
     _lastUpdatedAt = vm.fetched_at ? new Date(vm.fetched_at) : new Date();
     _refreshFailed = false;
     setConnectionState("ok");
-    updateRefreshTooltip();
   } catch (e) {
     _refreshFailed = true;
     setConnectionState("error");
-    updateRefreshTooltip();
   } finally {
+    // 必须在 _refreshInFlight=false 之后再 update tooltip，否则 tooltip 会
+    // 卡在"正在刷新…"（因为 updateRefreshTooltip 根据 _refreshInFlight 推断状态）
     _refreshInFlight = false;
+    updateRefreshTooltip();
   }
 }
 
@@ -302,10 +303,14 @@ async function submitSetup() {
   try {
     const result = await invoke("save_key_and_test", { key });
     if (result.ok) {
-      // 保存成功 → 隐藏 setup、开始刷新
+      // 保存成功 → 隐藏 setup、启动轮询
       input.value = "";
       showSetup(false);
-      refresh();
+      if (window.__widget && window.__widget.startPolling) {
+        window.__widget.startPolling();
+      } else {
+        refresh();
+      }
     } else {
       errEl.textContent = `保存/测试失败：${result.error || "未知错误"}`;
       btn.disabled = false;
@@ -337,6 +342,48 @@ function setupSetupHandlers() {
   });
 }
 
+// ─── 幂等轮询控制器 ──────────────────────────────────
+// 多重 init / setup 成功 / 多次 setupOverlay 关闭 都可能触发 startPolling，
+// 必须保证只创建一个 interval。
+let _pollTimer = null;
+let _visible = typeof document !== "undefined" ? !document.hidden : true;
+
+function startPolling() {
+  if (_pollTimer !== null) return;
+  // 启动立即拉一次，再周期性拉
+  refresh();
+  _pollTimer = setInterval(refresh, REFRESH_MS);
+}
+
+function stopPolling() {
+  if (_pollTimer === null) return;
+  clearInterval(_pollTimer);
+  _pollTimer = null;
+}
+
+// 窗口隐藏时暂停高频请求（CPU / 流量）。显示时立即恢复并补一次。
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    const wasVisible = _visible;
+    _visible = !document.hidden;
+    if (!wasVisible && _visible) {
+      // hidden → visible：恢复轮询 + 立刻拉一次
+      startPolling();
+    } else if (wasVisible && !_visible) {
+      // visible → hidden：暂停轮询
+      stopPolling();
+    }
+  });
+  // 页面卸载时清理 timer
+  window.addEventListener("pagehide", () => stopPolling());
+  window.addEventListener("beforeunload", () => stopPolling());
+}
+
+// 暴露给 setup 成功时调用
+window.__widget = window.__widget || {};
+window.__widget.startPolling = startPolling;
+window.__widget.stopPolling = stopPolling;
+
 async function init() {
   try {
     tlog("info", "init: start");
@@ -353,9 +400,8 @@ async function init() {
     tlog("info", "init: probe_state returned " + JSON.stringify(probeResult));
     if (!probeResult.has_key) {
       showSetup(true);
-    } else {
-      refresh();
-      setInterval(refresh, REFRESH_MS);
+    } else if (_visible) {
+      startPolling();
     }
   } catch (e) {
     tlog("error", "init failed: " + e.message);
