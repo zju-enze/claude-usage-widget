@@ -1,8 +1,15 @@
 use std::fs;
+use std::sync::Arc;
 use serde::Serialize;
 use tauri::Manager;
 
 mod api;
+
+/// 共享运行时状态：HTTP 连接池复用，避免每次 fetch_minimax_usage
+/// 都重新做 TLS 握手 + DNS 解析 + TCP 连接池重建。
+struct AppState {
+    client: reqwest::Client,
+}
 
 #[derive(Serialize)]
 struct UsageSnapshot {
@@ -409,21 +416,22 @@ fn resolve_api_key() -> Result<ResolvedApiKey, String> {
 }
 
 #[tauri::command]
-async fn fetch_minimax_usage() -> UsageSnapshot {
+async fn fetch_minimax_usage(state: tauri::State<'_, Arc<AppState>>) -> Result<UsageSnapshot, String> {
     use crate::api::fetch_usage;
 
     let resolved = match resolve_api_key() {
         Ok(r) => r,
         Err(_) => {
-            return UsageSnapshot::error("未配置 API Key".to_string(), "missing-key");
+            return Ok(UsageSnapshot::error("未配置 API Key".to_string(), "missing-key"));
         }
     };
 
-    // 共享 reqwest Client：每次调用都新建 client 等于 TLS 握手 + 连接池重建。
-    // 这里每次都新建是临时方案——阶段 9 会用 AppState 共享。
-    let client = crate::api::build_client();
+    // 共享 reqwest Client（来自 AppState）—— 复用 TLS 连接池。
+    // clone() 只是 Arc 引用计数增加，不是新建连接。
+    let client = state.client.clone();
+    let api_key = resolved.value;
 
-    let view_model = match fetch_usage(&client, &resolved.value).await {
+    let view_model = match fetch_usage(&client, &api_key).await {
         Ok(vm) => vm,
         Err(err) => {
             #[cfg(debug_assertions)]
@@ -431,11 +439,11 @@ async fn fetch_minimax_usage() -> UsageSnapshot {
                 "[minimax API] error kind={:?} retry_after={:?}",
                 err.kind, err.retry_after_seconds
             );
-            return UsageSnapshot::error(err.user_message, err_kind_label(err.kind));
+            return Ok(UsageSnapshot::error(err.user_message, err_kind_label(err.kind)));
         }
     };
 
-    UsageSnapshot::from_view_model(view_model, &resolved.source)
+    Ok(UsageSnapshot::from_view_model(view_model, &resolved.source))
 }
 
 /// 把 UsageErrorKind 映射到前端 tooltip 上能展示的简短类别标签。
@@ -791,6 +799,9 @@ pub fn run() {
             read_active_model,
         ])
         .setup(|app| {
+            // 共享 reqwest Client（连接池复用）→ 通过 Tauri AppState 注入
+            app.manage(Arc::new(AppState { client: crate::api::build_client() }));
+
             if let Some(window) = app.get_webview_window("main") {
                 // 决定初始可见性：
                 //   - 无 Key：首次安装用户必须能直接看到配置向导
