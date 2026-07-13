@@ -101,6 +101,30 @@ function updateRefreshTooltip() {
   btn.setAttribute("aria-label", tip.replace("\n", " · "));
 }
 
+// 上次更新独立 meta-row 文本生成。
+// 同一天：`HH:mm:ss`；跨天：`昨天 HH:mm:ss` 或 `MM-DD HH:mm:ss`（更早）。
+function formatLastUpdated(date) {
+  if (!date) return "--";
+  const now = new Date();
+  const sameDay = date.toDateString() === now.toDateString();
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  const isYesterday = date.toDateString() === yesterday.toDateString();
+  const hh = date.toLocaleTimeString("zh-CN", {
+    hour: "2-digit", minute: "2-digit", second: "2-digit", timeZone: TZ, hour12: false,
+  });
+  if (sameDay) return hh;
+  if (isYesterday) return `昨天 ${hh}`;
+  const md = String(date.getMonth() + 1).padStart(2, "0") + "-" + String(date.getDate()).padStart(2, "0");
+  return `${md} ${hh}`;
+}
+
+function updateLastUpdatedRow() {
+  const el = document.getElementById("last-updated");
+  if (!el) return;
+  el.textContent = formatLastUpdated(_lastUpdatedAt);
+}
+
 // ─── 单条进度条 ──────────────────────────────────────────
 // 颜色：已用 ≤70% 绿、70–90% 黄、>90% 红
 function paintBar(fillId, pctId, subId, usedPct, resetMs, subText) {
@@ -226,6 +250,7 @@ async function refresh() {
     // 卡在"正在刷新…"（因为 updateRefreshTooltip 根据 _refreshInFlight 推断状态）
     _refreshInFlight = false;
     updateRefreshTooltip();
+    updateLastUpdatedRow();
   }
 }
 
