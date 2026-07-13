@@ -1,6 +1,6 @@
+use serde::Serialize;
 use std::fs;
 use std::sync::Arc;
-use serde::Serialize;
 use tauri::Manager;
 
 mod api;
@@ -86,7 +86,7 @@ impl UsageSnapshot {
 #[derive(Serialize)]
 struct ProbeState {
     has_key: bool,
-    source: String,    // "saved" | "env" | "missing" —— 不暴露具体路径 / 变量名
+    source: String, // "saved" | "env" | "missing" —— 不暴露具体路径 / 变量名
 }
 
 #[derive(Serialize)]
@@ -126,7 +126,8 @@ mod keystore {
         // 加密到内存
         let mut buf = Vec::with_capacity(plaintext.len() * 2 + 8);
         buf.extend_from_slice(&super::windows_crypto::CRYPTPROTECT_DATA_HEADER);
-        super::windows_crypto::encrypt(plaintext, &mut buf).map_err(|e| format!("dpapi encrypt: {e}"))?;
+        super::windows_crypto::encrypt(plaintext, &mut buf)
+            .map_err(|e| format!("dpapi encrypt: {e}"))?;
 
         // 写临时文件
         let tmp = path.with_extension("bin.tmp");
@@ -148,7 +149,9 @@ mod keystore {
     /// 从磁盘读取并用 DPAPI 解密
     pub fn load() -> Result<Vec<u8>, String> {
         let path = key_path();
-        if !path.exists() { return Err("not found".to_string()); }
+        if !path.exists() {
+            return Err("not found".to_string());
+        }
         let buf = fs::read(&path).map_err(|e| format!("read: {e}"))?;
         if buf.len() < 4 || buf[..4] != super::windows_crypto::CRYPTPROTECT_DATA_HEADER {
             return Err("not a dpapi blob".to_string());
@@ -178,7 +181,10 @@ mod windows_crypto {
     impl DpapiBuffer {
         /// 空 buffer（DPAPI 在错误或空响应时返回）
         fn empty() -> Self {
-            Self { ptr: std::ptr::null_mut(), len: 0 }
+            Self {
+                ptr: std::ptr::null_mut(),
+                len: 0,
+            }
         }
 
         /// 复制到新 Vec 后，buffer 仍需通过 Drop 释放
@@ -210,7 +216,7 @@ mod windows_crypto {
                 unsafe {
                     // LocalFree 是 DPAPI/CryptProtectData/CryptUnprotectData 文档要求
                     // 的释放函数（不能用 free / GlobalFree）。
-                    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+                    use windows::Win32::Foundation::{LocalFree, HLOCAL};
                     let h = HLOCAL(self.ptr as *mut _);
                     let _ = LocalFree(h);
                 }
@@ -219,9 +225,7 @@ mod windows_crypto {
     }
 
     fn call_protect(plaintext: &[u8]) -> windows::core::Result<DpapiBuffer> {
-        use windows::Win32::Security::Cryptography::{
-            CryptProtectData, CRYPT_INTEGER_BLOB,
-        };
+        use windows::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
         let mut in_blob = CRYPT_INTEGER_BLOB {
             cbData: plaintext.len() as u32,
             pbData: plaintext.as_ptr() as *mut u8,
@@ -252,9 +256,7 @@ mod windows_crypto {
     }
 
     fn call_unprotect(payload: &[u8]) -> windows::core::Result<DpapiBuffer> {
-        use windows::Win32::Security::Cryptography::{
-            CryptUnprotectData, CRYPT_INTEGER_BLOB,
-        };
+        use windows::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
         let mut in_blob = CRYPT_INTEGER_BLOB {
             cbData: payload.len() as u32,
             pbData: payload.as_ptr() as *mut u8,
@@ -263,9 +265,7 @@ mod windows_crypto {
             cbData: 0,
             pbData: std::ptr::null_mut(),
         };
-        unsafe {
-            CryptUnprotectData(&mut in_blob, None, None, None, None, 0, &mut out_blob)?
-        };
+        unsafe { CryptUnprotectData(&mut in_blob, None, None, None, None, 0, &mut out_blob)? };
         if out_blob.cbData == 0 || out_blob.pbData.is_null() {
             Ok(DpapiBuffer::empty())
         } else {
@@ -378,7 +378,10 @@ fn resolve_api_key() -> Result<ResolvedApiKey, String> {
         if let Ok(v) = std::env::var(name) {
             let trimmed = v.trim();
             if !trimmed.is_empty() {
-                return Ok(ResolvedApiKey { value: trimmed.to_string(), source: KeySource::ProcessEnv });
+                return Ok(ResolvedApiKey {
+                    value: trimmed.to_string(),
+                    source: KeySource::ProcessEnv,
+                });
             }
         }
     }
@@ -393,7 +396,10 @@ fn resolve_api_key() -> Result<ResolvedApiKey, String> {
                 if let Ok(v) = hkcu.get_value::<String, _>(name) {
                     let trimmed = v.trim();
                     if !trimmed.is_empty() {
-                        return Ok(ResolvedApiKey { value: trimmed.to_string(), source: KeySource::UserEnv });
+                        return Ok(ResolvedApiKey {
+                            value: trimmed.to_string(),
+                            source: KeySource::UserEnv,
+                        });
                     }
                 }
             }
@@ -406,7 +412,10 @@ fn resolve_api_key() -> Result<ResolvedApiKey, String> {
             if let Ok(s) = std::str::from_utf8(&bytes) {
                 let trimmed = s.trim();
                 if !trimmed.is_empty() {
-                    return Ok(ResolvedApiKey { value: trimmed.to_string(), source: KeySource::SecureStore });
+                    return Ok(ResolvedApiKey {
+                        value: trimmed.to_string(),
+                        source: KeySource::SecureStore,
+                    });
                 }
             }
         }
@@ -416,13 +425,18 @@ fn resolve_api_key() -> Result<ResolvedApiKey, String> {
 }
 
 #[tauri::command]
-async fn fetch_minimax_usage(state: tauri::State<'_, Arc<AppState>>) -> Result<UsageSnapshot, String> {
+async fn fetch_minimax_usage(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<UsageSnapshot, String> {
     use crate::api::fetch_usage;
 
     let resolved = match resolve_api_key() {
         Ok(r) => r,
         Err(_) => {
-            return Ok(UsageSnapshot::error("未配置 API Key".to_string(), "missing-key"));
+            return Ok(UsageSnapshot::error(
+                "未配置 API Key".to_string(),
+                "missing-key",
+            ));
         }
     };
 
@@ -439,7 +453,10 @@ async fn fetch_minimax_usage(state: tauri::State<'_, Arc<AppState>>) -> Result<U
                 "[minimax API] error kind={:?} retry_after={:?}",
                 err.kind, err.retry_after_seconds
             );
-            return Ok(UsageSnapshot::error(err.user_message, err_kind_label(err.kind)));
+            return Ok(UsageSnapshot::error(
+                err.user_message,
+                err_kind_label(err.kind),
+            ));
         }
     };
 
@@ -488,22 +505,34 @@ fn read_active_model() -> ActiveModelInfo {
         if let Ok(v) = std::env::var(name) {
             let t = v.trim();
             if !t.is_empty() {
-                return ActiveModelInfo { model: Some(t.to_string()), source: "env".to_string() };
+                return ActiveModelInfo {
+                    model: Some(t.to_string()),
+                    source: "env".to_string(),
+                };
             }
         }
     }
     // 2) Claude Code 配置 (~/.claude/settings.json / settings.local.json)
-    if let Some(home) = std::env::var("HOME").ok().or_else(|| std::env::var("USERPROFILE").ok()) {
+    if let Some(home) = std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())
+    {
         for fname in &["settings.json", "settings.local.json"] {
             let p = std::path::PathBuf::from(&home).join(".claude").join(fname);
             if let Ok(text) = std::fs::read_to_string(&p) {
                 if let Some(m) = extract_model_from_claude_settings(&text) {
-                    return ActiveModelInfo { model: Some(m), source: "config".to_string() };
+                    return ActiveModelInfo {
+                        model: Some(m),
+                        source: "config".to_string(),
+                    };
                 }
             }
         }
     }
-    ActiveModelInfo { model: None, source: "none".to_string() }
+    ActiveModelInfo {
+        model: None,
+        source: "none".to_string(),
+    }
 }
 
 /// 从 Claude Code settings.json 文本中提取 model 字段。
@@ -512,17 +541,27 @@ fn extract_model_from_claude_settings(text: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     if let Some(s) = v.get("model").and_then(|x| x.as_str()) {
         let t = s.trim();
-        if !t.is_empty() { return Some(t.to_string()); }
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
     }
-    if let Some(id) = v.get("model").and_then(|x| x.get("id")).and_then(|x| x.as_str()) {
+    if let Some(id) = v
+        .get("model")
+        .and_then(|x| x.get("id"))
+        .and_then(|x| x.as_str())
+    {
         let t = id.trim();
-        if !t.is_empty() { return Some(t.to_string()); }
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
     }
     if let Some(env) = v.get("env").and_then(|x| x.as_object()) {
         for key in &["MINIMAX_MODEL", "CLAUDE_MODEL", "ANTHROPIC_MODEL"] {
             if let Some(s) = env.get(*key).and_then(|x| x.as_str()) {
                 let t = s.trim();
-                if !t.is_empty() { return Some(t.to_string()); }
+                if !t.is_empty() {
+                    return Some(t.to_string());
+                }
             }
         }
     }
@@ -553,10 +592,16 @@ async fn save_key_and_test(key: String) -> SaveResult {
     let trimmed = key.trim().to_string();
     const MAX_KEY_LEN: usize = 512;
     if trimmed.len() < 20 || trimmed.len() > MAX_KEY_LEN {
-        return SaveResult { ok: false, error: Some("key 长度应在 20–512 字符之间".to_string()) };
+        return SaveResult {
+            ok: false,
+            error: Some("key 长度应在 20–512 字符之间".to_string()),
+        };
     }
     if !trimmed.starts_with("sk-cp-") {
-        return SaveResult { ok: false, error: Some("key 应以 sk-cp- 开头".to_string()) };
+        return SaveResult {
+            ok: false,
+            error: Some("key 应以 sk-cp- 开头".to_string()),
+        };
     }
 
     // 2) 用内存中的候选 key 调 API —— 失败不破坏旧 key
@@ -565,7 +610,12 @@ async fn save_key_and_test(key: String) -> SaveResult {
         .build()
     {
         Ok(c) => c,
-        Err(e) => return SaveResult { ok: false, error: Some(format!("client build: {e}")) },
+        Err(e) => {
+            return SaveResult {
+                ok: false,
+                error: Some(format!("client build: {e}")),
+            }
+        }
     };
     let resp = client
         .get("https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains")
@@ -580,9 +630,15 @@ async fn save_key_and_test(key: String) -> SaveResult {
             // 3) 明确认证成功 → 临时文件 → 原子 rename
             // 注意：keystore::save 已经是"先写临时文件再 rename"的原子操作
             if let Err(e) = keystore::save(trimmed.as_bytes()) {
-                return SaveResult { ok: false, error: Some(format!("保存失败：{e}")) };
+                return SaveResult {
+                    ok: false,
+                    error: Some(format!("保存失败：{e}")),
+                };
             }
-            SaveResult { ok: true, error: None }
+            SaveResult {
+                ok: true,
+                error: None,
+            }
         }
         Ok(r) => {
             // 4xx 表示 key 无效（401/403）；不修改磁盘上的旧 key
@@ -594,11 +650,17 @@ async fn save_key_and_test(key: String) -> SaveResult {
             } else {
                 format!("API {} — {}", status, snippet)
             };
-            SaveResult { ok: false, error: Some(msg) }
+            SaveResult {
+                ok: false,
+                error: Some(msg),
+            }
         }
         Err(e) => {
             // 网络错误：保留旧 key
-            SaveResult { ok: false, error: Some(format!("网络错误，未修改已存 Key：{e}")) }
+            SaveResult {
+                ok: false,
+                error: Some(format!("网络错误，未修改已存 Key：{e}")),
+            }
         }
     }
 }
@@ -607,7 +669,8 @@ async fn save_key_and_test(key: String) -> SaveResult {
 /// 删除 `open_url(url: String)` 通用命令，攻击面降至唯一允许的 HTTPS URL。
 #[tauri::command]
 fn open_minimax_key_page() -> Result<(), String> {
-    const ALLOWED: &str = "https://platform.minimaxi.com/user-center/basic-information/interface-key";
+    const ALLOWED: &str =
+        "https://platform.minimaxi.com/user-center/basic-information/interface-key";
     open::that_detached(ALLOWED).map_err(|e| format!("open: {e}"))?;
     Ok(())
 }
@@ -643,7 +706,7 @@ fn enable_autostart(app: tauri::AppHandle) -> Result<bool, String> {
             .set_value("ClaudeUsageWidget", &value)
             .map_err(|e| format!("set Run: {e}"))?;
         #[cfg(debug_assertions)]
-    eprintln!("[claude-usage-widget] autostart enabled → {}", value);
+        eprintln!("[claude-usage-widget] autostart enabled → {}", value);
         let _ = app;
         Ok(true)
     }
@@ -688,9 +751,7 @@ fn is_autostart_enabled() -> bool {
         use winreg::enums::*;
         use winreg::RegKey;
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        if let Ok(run_key) =
-            hkcu.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
-        {
+        if let Ok(run_key) = hkcu.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run") {
             return run_key.get_value::<String, _>("ClaudeUsageWidget").is_ok();
         }
         false
@@ -707,20 +768,20 @@ fn is_autostart_enabled() -> bool {
 fn is_claude_code_running() -> bool {
     #[cfg(target_os = "windows")]
     {
-        use windows::Win32::System::ProcessStatus::{
-            EnumProcesses, K32GetModuleFileNameExW,
-        };
-        use windows::Win32::System::Threading::{
-            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
         use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::ProcessStatus::{EnumProcesses, K32GetModuleFileNameExW};
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
         const MAX_PIDS: usize = 4096;
         let mut pids = vec![0u32; MAX_PIDS];
         let mut bytes_returned = 0u32;
         // SAFETY: EnumProcesses 写入到 pids 缓冲区。我们传递足够大的缓冲区。
         let result = unsafe {
-            EnumProcesses(pids.as_mut_ptr(), (MAX_PIDS * 4) as u32, &mut bytes_returned)
+            EnumProcesses(
+                pids.as_mut_ptr(),
+                (MAX_PIDS * 4) as u32,
+                &mut bytes_returned,
+            )
         };
         if result.is_err() {
             return false;
@@ -739,11 +800,13 @@ fn is_claude_code_running() -> bool {
             let mut buf = [0u16; 256];
             // windows 0.58: K32GetModuleFileNameExW 接收 HANDLE 接口；
             // 直接传 handle（HANDLE 类型）或 .into() 转。
-            let len = unsafe {
-                K32GetModuleFileNameExW(handle, None, &mut buf)
-            };
-            unsafe { let _ = CloseHandle(handle); }
-            if len == 0 { continue; }
+            let len = unsafe { K32GetModuleFileNameExW(handle, None, &mut buf) };
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            if len == 0 {
+                continue;
+            }
             let path = String::from_utf16_lossy(&buf[..len as usize]).to_lowercase();
             if path.ends_with("\\claude.exe")
                 || path.ends_with("/claude.exe")
@@ -853,4 +916,87 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_model_from_claude_settings;
+
+    #[test]
+    fn extract_model_top_level() {
+        let json = r#"{ "model": "MiniMax-M3" }"#;
+        assert_eq!(
+            extract_model_from_claude_settings(json),
+            Some("MiniMax-M3".into())
+        );
+    }
+
+    #[test]
+    fn extract_model_nested_id() {
+        let json = r#"{ "model": { "id": "MiniMax-M2.7-highspeed" } }"#;
+        assert_eq!(
+            extract_model_from_claude_settings(json),
+            Some("MiniMax-M2.7-highspeed".into())
+        );
+    }
+
+    #[test]
+    fn extract_model_env_anthropic() {
+        let json = r#"{ "env": { "ANTHROPIC_MODEL": "MiniMax-M2.7" } }"#;
+        assert_eq!(
+            extract_model_from_claude_settings(json),
+            Some("MiniMax-M2.7".into())
+        );
+    }
+
+    #[test]
+    fn extract_model_env_minimax() {
+        let json = r#"{ "env": { "MINIMAX_MODEL": "MiniMax-M2.5-highspeed" } }"#;
+        assert_eq!(
+            extract_model_from_claude_settings(json),
+            Some("MiniMax-M2.5-highspeed".into())
+        );
+    }
+
+    #[test]
+    fn extract_model_prefers_top_level_over_env() {
+        let json = r#"{ "model": "TopLevel", "env": { "ANTHROPIC_MODEL": "EnvLevel" } }"#;
+        assert_eq!(
+            extract_model_from_claude_settings(json),
+            Some("TopLevel".into())
+        );
+    }
+
+    #[test]
+    fn extract_model_trims_whitespace() {
+        let json = r#"{ "model": "   MiniMax-M3   " }"#;
+        assert_eq!(
+            extract_model_from_claude_settings(json),
+            Some("MiniMax-M3".into())
+        );
+    }
+
+    #[test]
+    fn extract_model_empty_string_returns_none() {
+        let json = r#"{ "model": "   " }"#;
+        assert_eq!(extract_model_from_claude_settings(json), None);
+    }
+
+    #[test]
+    fn extract_model_no_field_returns_none() {
+        let json = r#"{ "permissions": {}, "env": {} }"#;
+        assert_eq!(extract_model_from_claude_settings(json), None);
+    }
+
+    #[test]
+    fn extract_model_invalid_json_returns_none() {
+        assert_eq!(extract_model_from_claude_settings("not json"), None);
+    }
+
+    #[test]
+    fn extract_model_unrelated_env_keys_ignored() {
+        // env contains PATH but no model key
+        let json = r#"{ "env": { "PATH": "/usr/bin" } }"#;
+        assert_eq!(extract_model_from_claude_settings(json), None);
+    }
 }

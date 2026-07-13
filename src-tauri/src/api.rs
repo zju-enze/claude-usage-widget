@@ -145,11 +145,16 @@ pub(super) fn remaining_to_used(remaining: Option<f64>) -> Option<f64> {
 /// Pick the primary window: status == 1 if any, otherwise the first entry.
 /// Unknown / missing status still yields a safe fallback (first entry).
 pub(super) fn pick_primary<'a>(rows: &'a [ApiModelRemain]) -> Option<&'a ApiModelRemain> {
-    rows.iter().find(|r| r.current_interval_status == Some(1)).or(rows.first())
+    rows.iter()
+        .find(|r| r.current_interval_status == Some(1))
+        .or(rows.first())
 }
 
 /// Translate wire → view-model. Pure, no I/O.
-pub(super) fn to_view_model(primary: Option<&ApiModelRemain>, fetched_at: String) -> UsageViewModel {
+pub(super) fn to_view_model(
+    primary: Option<&ApiModelRemain>,
+    fetched_at: String,
+) -> UsageViewModel {
     let (five_hour, weekly, state) = match primary {
         Some(p) => {
             let five_rem = parse_percent(p.current_interval_remaining_percent.as_ref());
@@ -174,12 +179,27 @@ pub(super) fn to_view_model(primary: Option<&ApiModelRemain>, fetched_at: String
             (five_hour, weekly, state)
         }
         None => (
-            UsageWindowView { used_percent: None, reset_after_ms: None, start_at_ms: None, end_at_ms: None },
-            UsageWindowView { used_percent: None, reset_after_ms: None, start_at_ms: None, end_at_ms: None },
+            UsageWindowView {
+                used_percent: None,
+                reset_after_ms: None,
+                start_at_ms: None,
+                end_at_ms: None,
+            },
+            UsageWindowView {
+                used_percent: None,
+                reset_after_ms: None,
+                start_at_ms: None,
+                end_at_ms: None,
+            },
             UsageState::NoData,
         ),
     };
-    UsageViewModel { five_hour, weekly, fetched_at, state }
+    UsageViewModel {
+        five_hour,
+        weekly,
+        fetched_at,
+        state,
+    }
 }
 
 // ─── HTTP client + retry policy ────────────────────────────────
@@ -245,11 +265,23 @@ async fn try_once(client: &reqwest::Client, api_key: &str) -> FetchAttempt {
         Ok(r) => r,
         Err(e) => {
             return if e.is_timeout() {
-                FetchAttempt::Retry(UsageError { kind: UsageErrorKind::Timeout, user_message: user_message(UsageErrorKind::Timeout), retry_after_seconds: None })
+                FetchAttempt::Retry(UsageError {
+                    kind: UsageErrorKind::Timeout,
+                    user_message: user_message(UsageErrorKind::Timeout),
+                    retry_after_seconds: None,
+                })
             } else if e.is_connect() || e.is_request() {
-                FetchAttempt::Retry(UsageError { kind: UsageErrorKind::Network, user_message: user_message(UsageErrorKind::Network), retry_after_seconds: None })
+                FetchAttempt::Retry(UsageError {
+                    kind: UsageErrorKind::Network,
+                    user_message: user_message(UsageErrorKind::Network),
+                    retry_after_seconds: None,
+                })
             } else {
-                FetchAttempt::GiveUp(UsageError { kind: UsageErrorKind::Network, user_message: user_message(UsageErrorKind::Network), retry_after_seconds: None })
+                FetchAttempt::GiveUp(UsageError {
+                    kind: UsageErrorKind::Network,
+                    user_message: user_message(UsageErrorKind::Network),
+                    retry_after_seconds: None,
+                })
             }
         }
     };
@@ -262,7 +294,11 @@ async fn try_once(client: &reqwest::Client, api_key: &str) -> FetchAttempt {
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
-        let err = UsageError { kind, user_message: user_message(kind), retry_after_seconds: retry_after };
+        let err = UsageError {
+            kind,
+            user_message: user_message(kind),
+            retry_after_seconds: retry_after,
+        };
         // 401/403 give up; 429 + 5xx are retryable
         return match kind {
             UsageErrorKind::InvalidKey | UsageErrorKind::Forbidden => FetchAttempt::GiveUp(err),
@@ -333,7 +369,10 @@ async fn try_once(client: &reqwest::Client, api_key: &str) -> FetchAttempt {
 
 /// Public entry: fetch with bounded retries (2 retries → 3 attempts total).
 /// Exponential backoff with light jitter, honors Retry-After when present.
-pub async fn fetch_usage(client: &reqwest::Client, api_key: &str) -> Result<UsageViewModel, UsageError> {
+pub async fn fetch_usage(
+    client: &reqwest::Client,
+    api_key: &str,
+) -> Result<UsageViewModel, UsageError> {
     const MAX_ATTEMPTS: u32 = 3;
     let mut attempt_idx: u32 = 0;
     loop {
@@ -438,23 +477,27 @@ mod tests {
                 end_time: None,
             },
         ];
-        assert_eq!(pick_primary(&rows).unwrap().current_interval_status, Some(1));
+        assert_eq!(
+            pick_primary(&rows).unwrap().current_interval_status,
+            Some(1)
+        );
     }
 
     #[test]
     fn pick_primary_fallback_to_first_when_no_status_one() {
-        let rows = vec![
-            ApiModelRemain {
-                current_interval_status: Some(3),
-                current_interval_remaining_percent: None,
-                current_weekly_remaining_percent: None,
-                remains_time: None,
-                weekly_remains_time: None,
-                start_time: None,
-                end_time: None,
-            },
-        ];
-        assert_eq!(pick_primary(&rows).unwrap().current_interval_status, Some(3));
+        let rows = vec![ApiModelRemain {
+            current_interval_status: Some(3),
+            current_interval_remaining_percent: None,
+            current_weekly_remaining_percent: None,
+            remains_time: None,
+            weekly_remains_time: None,
+            start_time: None,
+            end_time: None,
+        }];
+        assert_eq!(
+            pick_primary(&rows).unwrap().current_interval_status,
+            Some(3)
+        );
     }
 
     #[test]
@@ -517,12 +560,30 @@ mod tests {
 
     #[test]
     fn classify_status_for_each_known_code() {
-        assert_eq!(classify_status(reqwest::StatusCode::UNAUTHORIZED), UsageErrorKind::InvalidKey);
-        assert_eq!(classify_status(reqwest::StatusCode::FORBIDDEN), UsageErrorKind::Forbidden);
-        assert_eq!(classify_status(reqwest::StatusCode::TOO_MANY_REQUESTS), UsageErrorKind::RateLimited);
-        assert_eq!(classify_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR), UsageErrorKind::Server);
-        assert_eq!(classify_status(reqwest::StatusCode::BAD_GATEWAY), UsageErrorKind::Server);
-        assert_eq!(classify_status(reqwest::StatusCode::SERVICE_UNAVAILABLE), UsageErrorKind::Server);
+        assert_eq!(
+            classify_status(reqwest::StatusCode::UNAUTHORIZED),
+            UsageErrorKind::InvalidKey
+        );
+        assert_eq!(
+            classify_status(reqwest::StatusCode::FORBIDDEN),
+            UsageErrorKind::Forbidden
+        );
+        assert_eq!(
+            classify_status(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            UsageErrorKind::RateLimited
+        );
+        assert_eq!(
+            classify_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+            UsageErrorKind::Server
+        );
+        assert_eq!(
+            classify_status(reqwest::StatusCode::BAD_GATEWAY),
+            UsageErrorKind::Server
+        );
+        assert_eq!(
+            classify_status(reqwest::StatusCode::SERVICE_UNAVAILABLE),
+            UsageErrorKind::Server
+        );
     }
 
     #[test]
