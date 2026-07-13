@@ -292,6 +292,87 @@ fn frontend_log(level: String, msg: String) {
     eprintln!("[frontend {}] {}", level, msg);
 }
 
+/// 当前套餐暂不在 UI 展示。
+///
+/// 原因：`/v1/api/openplatform/coding_plan/remains` 端点不返回套餐名称，
+/// 公开的 minimaxi.com 开发者文档也未列出专门的套餐信息端点。
+/// 在不能从权威数据源读取的情况下，"硬编码套餐名 + 徽标" 等同于编造数据，
+/// 不符合本项目"真实数据驱动"原则。
+///
+/// 如果未来 minimaxi 提供返回套餐名的公开端点（如 `/v1/api/openplatform/coding_plan/info`），
+/// 在这里实现真正的读取逻辑后，再恢复前端套餐行。
+#[tauri::command]
+fn read_plan_metadata() -> Option<PlanMetadata> {
+    None
+}
+
+#[derive(Serialize)]
+struct PlanMetadata {
+    raw_plan_name: Option<String>,
+    display_plan_name: String,
+    plan_badge: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ActiveModelInfo {
+    model: Option<String>,
+    source: String, // "env" | "config" | "none"
+}
+
+/// 读取 Claude Code 当前实际配置的模型。
+/// 优先级：
+///   1. 环境变量 `MINIMAX_MODEL` / `CLAUDE_MODEL`
+///   2. Claude Code 配置文件 `~/.claude/settings.json` 中的 model 字段
+///   3. `~/.claude/settings.local.json`
+/// 失败返回 None（前端应隐藏"当前模型"行而不是编造）。
+#[tauri::command]
+fn read_active_model() -> ActiveModelInfo {
+    // 1) env var
+    for name in &["MINIMAX_MODEL", "CLAUDE_MODEL", "ANTHROPIC_MODEL"] {
+        if let Ok(v) = std::env::var(name) {
+            let t = v.trim();
+            if !t.is_empty() {
+                return ActiveModelInfo { model: Some(t.to_string()), source: "env".to_string() };
+            }
+        }
+    }
+    // 2) Claude Code 配置 (~/.claude/settings.json / settings.local.json)
+    if let Some(home) = std::env::var("HOME").ok().or_else(|| std::env::var("USERPROFILE").ok()) {
+        for fname in &["settings.json", "settings.local.json"] {
+            let p = std::path::PathBuf::from(&home).join(".claude").join(fname);
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                if let Some(m) = extract_model_from_claude_settings(&text) {
+                    return ActiveModelInfo { model: Some(m), source: "config".to_string() };
+                }
+            }
+        }
+    }
+    ActiveModelInfo { model: None, source: "none".to_string() }
+}
+
+/// 从 Claude Code settings.json 文本中提取 model 字段。
+/// 支持顶层 `model` 字段、嵌套 `env.ANTHROPIC_MODEL`、嵌套 `model.id`。
+fn extract_model_from_claude_settings(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    if let Some(s) = v.get("model").and_then(|x| x.as_str()) {
+        let t = s.trim();
+        if !t.is_empty() { return Some(t.to_string()); }
+    }
+    if let Some(id) = v.get("model").and_then(|x| x.get("id")).and_then(|x| x.as_str()) {
+        let t = id.trim();
+        if !t.is_empty() { return Some(t.to_string()); }
+    }
+    if let Some(env) = v.get("env").and_then(|x| x.as_object()) {
+        for key in &["MINIMAX_MODEL", "CLAUDE_MODEL", "ANTHROPIC_MODEL"] {
+            if let Some(s) = env.get(*key).and_then(|x| x.as_str()) {
+                let t = s.trim();
+                if !t.is_empty() { return Some(t.to_string()); }
+            }
+        }
+    }
+    None
+}
+
 #[tauri::command]
 fn probe_state() -> ProbeState {
     let path = keystore::key_path();
@@ -557,6 +638,8 @@ pub fn run() {
             enable_autostart,
             disable_autostart,
             is_autostart_enabled,
+            read_plan_metadata,
+            read_active_model,
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {

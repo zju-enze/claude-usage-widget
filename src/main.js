@@ -50,11 +50,14 @@ function fmtTimeLocal(ms) {
   });
 }
 
-// ─── 状态行 ──────────────────────────────────────────────
-function setStatus(msg, isErr) {
-  const el = document.getElementById("status");
-  el.textContent = msg;
-  el.classList.toggle("dim", !!isErr);
+// ─── 状态行（保留内部 lastUpdated 状态；不再写入可见底部） ─────
+let _lastUpdatedAt = null;          // Date | null —— 内部状态
+let _refreshInFlight = false;       // 防止叠加请求
+let _refreshFailed = false;         // 最近一次是否失败
+
+function setStatus(_msg, _isErr) {
+  // 旧版底部 env · time 状态行已删除。这里保留为空实现，
+  // 保证历史调用点不会崩。lastUpdated 状态用 _lastUpdatedAt 单独维护。
 }
 
 function setConnectionState(state) {
@@ -63,6 +66,30 @@ function setConnectionState(state) {
   if (!dot) return;
   dot.classList.remove("state-idle", "state-loading", "state-ok", "state-warn", "state-error");
   dot.classList.add("state-" + state);
+  // 同步刷新按钮 tooltip 与 aria-label
+  updateRefreshTooltip();
+}
+
+function updateRefreshTooltip() {
+  const btn = document.getElementById("btn-refresh");
+  if (!btn) return;
+  let tip = "刷新用量";
+  const lines = [];
+  if (_refreshInFlight) {
+    lines.push("正在刷新…");
+  } else if (_refreshFailed) {
+    lines.push("刷新失败 · 点击重试");
+  } else if (_lastUpdatedAt) {
+    const ts = _lastUpdatedAt.toLocaleTimeString("zh-CN", {
+      hour: "2-digit", minute: "2-digit", second: "2-digit", timeZone: TZ, hour12: false,
+    });
+    lines.push(`上次更新：${ts}`);
+  } else {
+    lines.push("尚未刷新");
+  }
+  tip += "\n" + lines[0];
+  btn.setAttribute("title", tip);
+  btn.setAttribute("aria-label", tip.replace("\n", " · "));
 }
 
 // ─── 单条进度条 ──────────────────────────────────────────
@@ -100,50 +127,80 @@ function paintBar(fillId, pctId, subId, usedPct, resetMs, subText) {
   }
 }
 
-// ─── 模型行渲染 ──────────────────────────────────────────
-function renderModels(list) {
-  const root = document.getElementById("models-list");
-  root.innerHTML = "";
-  if (!Array.isArray(list) || list.length === 0) {
-    root.innerHTML = '<div class="dim" style="padding:6px 0;">无数据</div>';
-    return;
+// ─── 套餐名称已不在 UI 展示 ─────────────────────────────
+//
+// 为什么完全没有套餐字段：
+//   API `/v1/api/openplatform/coding_plan/remains` 不返回套餐名称。
+//   公开的 minimaxi.com 开发者文档也未列出专门的套餐信息端点。
+//   在没有权威数据源时，"硬编码 + 显示" 就是编造数据，违反本项目"真实数据驱动"原则。
+//
+// 当前 UI 中已无套餐行。如果未来 minimaxi 提供返回套餐名的端点，
+// 实现 Rust 端 read_plan_metadata + 前端套餐行。
+
+async function loadPlanMetadata() {
+  // 后端始终返回 None —— 调用保留以便将来扩展，但当前不做任何 UI 更新。
+  try { await invoke("read_plan_metadata"); } catch (e) { /* 静默 */ }
+}
+
+// ─── 当前模型读取 ───────────────────────────────────────
+// 严禁从 Token Plan API 的 model_name 字段推断当前模型。
+// 真实来源：环境变量 / Claude Code 配置文件（~/.claude/settings.json）。
+// 读取失败：隐藏整行而不是编造。
+async function loadActiveModel() {
+  const row = document.getElementById("model-row");
+  const pill = document.getElementById("model-name");
+  try {
+    const info = await invoke("read_active_model");
+    if (info && info.model && info.model.trim()) {
+      const m = info.model.trim();
+      pill.textContent = m;
+      pill.title = m;
+      pill.classList.remove("is-empty");
+      row.style.display = "";
+    } else {
+      pill.textContent = "未检测到";
+      pill.title = "无法可靠读取 Claude Code 当前模型";
+      pill.classList.add("is-empty");
+      row.style.display = "";
+    }
+  } catch (e) {
+    pill.textContent = "未检测到";
+    pill.title = "无法可靠读取 Claude Code 当前模型";
+    pill.classList.add("is-empty");
+    row.style.display = "";
   }
-  list.forEach((m) => {
-    // current_weekly_remaining_percent 是剩余%，已用 = 100 - rem
-    const rem = Number(m.current_weekly_remaining_percent);
-    const used = isNaN(rem) ? 0 : Math.max(0, Math.min(100, 100 - rem));
-    const cls = used >= 90 ? "bad" : used >= 70 ? "warn" : "";
-    const row = document.createElement("div");
-    row.className = "model-row";
-    const status = m.current_interval_status === 1 ? "" :
-                   m.current_interval_status === 3 ? " (赠送)" : " (?)";
-    row.innerHTML = `
-      <span class="mname">${escapeHtml(m.model_name || "?")}${status}</span>
-      <span class="mbar-bg"><span class="mbar-fill ${cls}" style="width:${used}%"></span></span>
-      <span class="mpct">${used.toFixed(0)}%</span>
-    `;
-    root.appendChild(row);
-  });
 }
 
 // ─── 主刷新 ──────────────────────────────────────────────
+//
+// 数据来源与处理边界：
+//   - 5h / 7d 用量：来自 coding_plan/remains 的 model_remains[0]
+//     （primary = current_interval_status === 1，否则取第一条）
+//   - 当前模型：来自 read_active_model（环境变量 / Claude Code 配置），
+//     不再从 model_remains[].model_name 推断
+//   - 套餐：来自 read_plan_metadata（API 不返回套餐名，硬编码显示）
+//   - 各模型剩余 %：API 字段存在但本组件不再进入 ViewModel
 async function refresh() {
+  if (_refreshInFlight) return;
+  _refreshInFlight = true;
+  setConnectionState("loading");
   try {
-    setConnectionState("loading");
     const snap = await invoke("fetch_minimax_usage");
     if (!snap.found) {
-      setStatus(snap.error || "读取失败", true);
+      _refreshFailed = true;
       setConnectionState("error");
+      updateRefreshTooltip();
       return;
     }
     const arr = snap.raw?.model_remains;
     if (!Array.isArray(arr) || arr.length === 0) {
-      setStatus("API 返回无 model_remains", true);
+      _refreshFailed = true;
       setConnectionState("error");
+      updateRefreshTooltip();
       return;
     }
 
-    // 找出主模型：current_interval_status === 1 表示在用（=3 是赠送额度）
+    // primary 仅用于 5h / 7d 字段解析（接口里 status===1 表示主档）
     const primary = arr.find(x => x.current_interval_status === 1) || arr[0];
 
     // `start_time`/`end_time` 是毫秒级 Unix 时间戳；`remains_time` 是毫秒数。
@@ -174,20 +231,18 @@ async function refresh() {
       "本周",
     );
 
-    document.getElementById("model-name").textContent = primary.model_name || "?";
-    document.getElementById("model-name").setAttribute("title", primary.model_name || "");
-    document.getElementById("model-block").style.display = "flex";
+    // 注意：不再写 #model-name（由 loadActiveModel 维护）
 
-    renderModels(arr);
-
-    const ts = new Date(snap.fetched_at).toLocaleTimeString("zh-CN", {
-      hour: "2-digit", minute: "2-digit", second: "2-digit", timeZone: TZ, hour12: false,
-    });
-    setStatus(`${snap.key_source === "missing" ? "no-key" : "env"} · ${ts}`, false);
+    _lastUpdatedAt = new Date(snap.fetched_at);
+    _refreshFailed = false;
     setConnectionState("ok");
+    updateRefreshTooltip();
   } catch (e) {
-    setStatus(`读失败: ${e}`, true);
+    _refreshFailed = true;
     setConnectionState("error");
+    updateRefreshTooltip();
+  } finally {
+    _refreshInFlight = false;
   }
 }
 
@@ -196,16 +251,8 @@ function setupButtons() {
   const refreshBtn = document.getElementById("btn-refresh");
   refreshBtn.addEventListener("click", (e) => {
     e.stopPropagation();
-    if (refreshBtn.classList.contains("is-spinning")) return;
-    refreshBtn.classList.add("is-spinning");
-    setConnectionState("loading");
-    const p = refresh();
-    const restore = () => refreshBtn.classList.remove("is-spinning");
-    if (p && typeof p.then === "function") {
-      p.finally(restore);
-    } else {
-      setTimeout(restore, 800);
-    }
+    if (_refreshInFlight) return;
+    refresh();
   });
 
   document.getElementById("btn-collapse").addEventListener("click", async (e) => {
@@ -217,7 +264,7 @@ function setupButtons() {
       icon.style.transform = collapsed ? "rotate(45deg)" : "rotate(0deg)";
     }
     try {
-      await win.setSize(new (win.constructor || Object).Size(360, collapsed ? 44 : 268));
+      await win.setSize(new (win.constructor || Object).Size(360, collapsed ? 44 : 198));
     } catch {}
   });
 
@@ -226,6 +273,8 @@ function setupButtons() {
     e.stopPropagation();
     if (win.isVisible()) win.hide(); else win.show();
   });
+  // 初始 tooltip
+  updateRefreshTooltip();
 }
 
 // ─── 启动探测 ──────────────────────────────────────────
@@ -312,16 +361,16 @@ async function init() {
     setupButtons();
     tlog("info", "init: setupButtons done");
     setupSetupHandlers();
-    tlog("info", "init: setupSetupHandlers done, calling probe_state");
+    tlog("info", "init: setupSetupHandlers done");
+
+    // 套餐 + 当前模型：与用量解耦，独立加载
+    await Promise.all([loadPlanMetadata(), loadActiveModel()]);
+
     setConnectionState("idle");
     const probeResult = await probe();
     tlog("info", "init: probe_state returned " + JSON.stringify(probeResult));
     if (!probeResult.has_key) {
-      // 注意：setup overlay 现在**默认就显示**，因为 widget 进程被启动
-      // 通常意味着用户想要配置什么。但窗口本身是 hide 的（Claude Code 没在）。
-      // Setup 是配置流，不是显示主界面；可以保留显示。
       showSetup(true);
-      setStatus("请先连接 MiniMax", true);
     } else {
       refresh();
       setInterval(refresh, REFRESH_MS);
