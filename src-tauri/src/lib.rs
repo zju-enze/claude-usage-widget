@@ -612,13 +612,12 @@ async fn save_key_and_test(key: String) -> SaveResult {
     }
 }
 
+/// 打开 MiniMax 官方 Key 管理页（URL 硬编码，禁止从前端注入任意 URL）。
+/// 删除 `open_url(url: String)` 通用命令，攻击面降至唯一允许的 HTTPS URL。
 #[tauri::command]
-async fn open_url(url: String) -> Result<(), String> {
-    let trimmed = url.trim();
-    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
-        return Err("URL 必须以 http(s):// 开头".to_string());
-    }
-    open::that_detached(trimmed).map_err(|e| format!("open: {e}"))?;
+fn open_minimax_key_page() -> Result<(), String> {
+    const ALLOWED: &str = "https://platform.minimaxi.com/user-center/basic-information/interface-key";
+    open::that_detached(ALLOWED).map_err(|e| format!("open: {e}"))?;
     Ok(())
 }
 
@@ -785,12 +784,11 @@ fn set_autohide(_enabled: bool) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             fetch_minimax_usage,
             probe_state,
             save_key_and_test,
-            open_url,
+            open_minimax_key_page,
             clear_key,
             claude_code_running,
             set_autohide,

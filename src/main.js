@@ -4,7 +4,15 @@ try {
   invoke = window.__TAURI__.core.invoke;
   getCurrentWindow = window.__TAURI__.window.getCurrentWindow;
 } catch (e) {
-  document.body.innerHTML += '<pre style="color:red;padding:8px;font-size:10px">[FE_TOP_ERR] ' + e.message + '</pre>';
+  // 拒绝 innerHTML：DOM XSS sink。改用 textContent 构造独立元素。
+  showBootError(e && e.message ? e.message : "unknown");
+}
+
+function showBootError(message) {
+  const pre = document.createElement("pre");
+  pre.style.cssText = "color:red;padding:10px;font-size:11px;white-space:pre-wrap;word-break:break-all;";
+  pre.textContent = "[BOOT_ERR] " + message;
+  document.body.appendChild(pre);
 }
 const tlog = (level, msg) => {
   // 仅写入 WebView 控制台。生产构建绝不发送任意字符串到 Rust stderr。
@@ -325,7 +333,7 @@ function setupSetupHandlers() {
   document.getElementById("setup-help").addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    invoke("open_url", { url: "https://platform.minimaxi.com/user-center/basic-information/interface-key" }).catch(() => {});
+    invoke("open_minimax_key_page").catch(() => {});
   });
 }
 
@@ -351,7 +359,7 @@ async function init() {
     }
   } catch (e) {
     tlog("error", "init failed: " + e.message);
-    document.body.innerHTML += '<pre style="color:red;padding:10px;font-size:11px;">[BOOT_ERR] ' + e.message + '</pre>';
+    showBootError(e && e.message ? e.message : String(e));
   }
 }
 
