@@ -565,6 +565,7 @@ async function selectProvider(provider, { focus = true } = {}) {
     renderSetupContent(keySource);
     if (state.has_key) {
       setConnectionState("idle", `${PROVIDERS[provider].name} 已连接`);
+      await refresh();
     } else {
       setConnectionState("warning", `连接 ${PROVIDERS[provider].name}`);
     }

@@ -1,7 +1,7 @@
 [package]
 name = "claude-usage-widget"
-version = "0.1.2"
-description = "A secure, compact MiniMax usage widget for Claude Code"
+version = "0.2.0"
+description = "A secure multi-provider usage widget for Claude Code"
 authors = ["Claude Usage Widget contributors"]
 edition = "2021"
 
@@ -29,4 +29,4 @@ tempfile = "3.27.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.52"
-windows = { version = "0.58", features = ["Win32_Security_Cryptography", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.58", features = ["Win32_Security_Cryptography", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_Foundation"] }

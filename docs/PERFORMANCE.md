@@ -1,6 +1,6 @@
 # Performance baseline
 
-Records performance characteristics of `claude-usage-widget` v0.2.
+Records performance characteristics of `claude-usage-widget` v0.2.0.
 Most numbers here are placeholders that require running on a real
 machine with Claude Code active; CI does not measure them.
 
@@ -54,9 +54,9 @@ policy: do not fabricate numbers. Run the scripts under
 - **Shared `reqwest::Client`** in `AppState` → TLS handshake + DNS +
   connection pool are reused across the 30-s polling interval.
   Avoids the "every fetch = new TLS handshake" anti-pattern.
-- **DPAPI RAII** in `windows_crypto::DpapiBuffer` → DPAPI buffers
-  are released via `LocalFree` on every code path. No per-fetch
-  `LocalAlloc` leak.
+- **Bounded DPAPI buffers** in `windows_crypto` → native output buffers
+  are copied, zeroed when they contain plaintext, and released with
+  `LocalFree` on every return path.
 - **Visibility-driven polling pause** (`document.visibilitychange`
   listener) → when the user hides the widget (or minimizes the
   desktop session), `stopPolling()` clears the timer. No 30-s
@@ -71,5 +71,6 @@ policy: do not fabricate numbers. Run the scripts under
   the `.bar-fill` div, not a per-frame JS-driven loop.
 - **`is-shine` class on the bar** is a one-shot keyframe (700 ms)
   triggered only when `prev !== next`, not a continuous loop.
-- **No `requestAnimationFrame` loop, no `setInterval` outside the
-  polling timer, no DOM mutation observer** that runs constantly.
+- **Pointer-coalesced refraction** uses at most one queued
+  `requestAnimationFrame` while the pointer is moving; it is not a
+  continuous animation loop. There is no DOM mutation observer.

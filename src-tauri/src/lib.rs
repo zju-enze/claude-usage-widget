@@ -49,6 +49,7 @@ struct AppState {
     client: reqwest::Client,
     selected_provider: Arc<Mutex<Provider>>,
     onboarding: Arc<AtomicBool>,
+    onboarding_dismissed: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -57,6 +58,7 @@ impl AppState {
             client,
             selected_provider: Arc::new(Mutex::new(provider)),
             onboarding: Arc::new(AtomicBool::new(onboarding)),
+            onboarding_dismissed: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -457,6 +459,7 @@ async fn fetch_usage(
     let fetched_at = chrono::Utc::now().to_rfc3339();
     let Some(key) = get_api_key(provider) else {
         state.onboarding.store(true, Ordering::Release);
+        state.onboarding_dismissed.store(false, Ordering::Release);
         return Ok(UsageSnapshot {
             found: false,
             error: Some("missing_key".to_string()),
@@ -522,9 +525,8 @@ fn probe_state(
             provider_name: provider.display_name().to_string(),
         },
     };
-    if !probe.has_key {
-        state.onboarding.store(true, Ordering::Release);
-    }
+    state.onboarding.store(!probe.has_key, Ordering::Release);
+    state.onboarding_dismissed.store(false, Ordering::Release);
     Ok(probe)
 }
 
@@ -592,6 +594,7 @@ async fn save_key_and_test(
         }
 
         state.onboarding.store(false, Ordering::Release);
+        state.onboarding_dismissed.store(false, Ordering::Release);
         Ok(SaveResult {
             ok: true,
             error: None,
@@ -608,6 +611,7 @@ fn clear_key(state: tauri::State<'_, AppState>, provider: String) -> Result<(), 
         fs::remove_file(path).map_err(|_| "remove_failed".to_string())?;
     }
     state.onboarding.store(true, Ordering::Release);
+    state.onboarding_dismissed.store(false, Ordering::Release);
     Ok(())
 }
 
@@ -619,7 +623,14 @@ fn open_help_page(state: tauri::State<'_, AppState>, provider: String) -> Result
 }
 
 #[tauri::command]
-fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
+fn hide_main_window(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let provider = selected_provider(&state);
+    if get_api_key(provider).is_none() {
+        state.onboarding_dismissed.store(true, Ordering::Release);
+    }
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "window_unavailable".to_string())?;
@@ -654,15 +665,13 @@ fn set_window_mode(
         }
         WindowMode::Setup => {
             state.onboarding.store(true, Ordering::Release);
+            state.onboarding_dismissed.store(false, Ordering::Release);
             (360.0, 372.0)
         }
     };
     window
         .set_size(tauri::LogicalSize::new(width, height))
         .map_err(|_| "resize_failed".to_string())?;
-
-    #[cfg(target_os = "windows")]
-    apply_rounded_window_region(&window, width, height)?;
 
     Ok(())
 }
@@ -765,189 +774,20 @@ fn is_claude_code_running() -> bool {
 }
 
 #[tauri::command]
-fn claude_code_running() -> bool {
-    is_claude_code_running()
-}
-
-#[tauri::command]
-fn enable_autostart(_app: tauri::AppHandle) -> Result<bool, String> {
-    #[cfg(target_os = "windows")]
-    {
-        use winreg::enums::{HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE};
-        use winreg::RegKey;
-
-        let executable =
-            std::env::current_exe().map_err(|_| "autostart_executable_unavailable".to_string())?;
-        let value = format!("\"{}\"", executable.display());
-        let run_key = RegKey::predef(HKEY_CURRENT_USER)
-            .open_subkey_with_flags(
-                r"Software\Microsoft\Windows\CurrentVersion\Run",
-                KEY_SET_VALUE | KEY_QUERY_VALUE,
-            )
-            .map_err(|_| "autostart_registry_unavailable".to_string())?;
-        run_key
-            .set_value("ClaudeUsageWidget", &value)
-            .map_err(|_| "autostart_enable_failed".to_string())?;
-        Ok(true)
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        Ok(false)
-    }
-}
-
-#[tauri::command]
-fn disable_autostart() -> Result<bool, String> {
-    #[cfg(target_os = "windows")]
-    {
-        use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
-        use winreg::RegKey;
-
-        let run_key = RegKey::predef(HKEY_CURRENT_USER)
-            .open_subkey_with_flags(
-                r"Software\Microsoft\Windows\CurrentVersion\Run",
-                KEY_SET_VALUE,
-            )
-            .map_err(|_| "autostart_registry_unavailable".to_string())?;
-        match run_key.delete_value("ClaudeUsageWidget") {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(_) => Err("autostart_disable_failed".to_string()),
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        Ok(false)
-    }
-}
-
-#[tauri::command]
-fn is_autostart_enabled() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        use winreg::enums::HKEY_CURRENT_USER;
-        use winreg::RegKey;
-
-        RegKey::predef(HKEY_CURRENT_USER)
-            .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
-            .and_then(|run_key| run_key.get_value::<String, _>("ClaudeUsageWidget"))
-            .is_ok()
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        false
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn system_transparency_enabled() -> bool {
-    use winreg::enums::HKEY_CURRENT_USER;
-    use winreg::RegKey;
-
-    RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
-        .and_then(|personalize| personalize.get_value::<u32, _>("EnableTransparency"))
-        .is_ok_and(|value| value != 0)
-}
-
-#[cfg(target_os = "windows")]
-const WINDOW_RADIUS_LOGICAL: f64 = 24.0;
-
-#[cfg(target_os = "windows")]
-fn apply_rounded_window_region(
-    window: &tauri::WebviewWindow,
-    logical_width: f64,
-    logical_height: f64,
-) -> Result<(), String> {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, DeleteObject, SetWindowRgn};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, HWND_TOP, SWP_FRAMECHANGED,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_MAXIMIZEBOX,
-        WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
-    };
-
-    let scale = window
-        .scale_factor()
-        .map_err(|_| "window_scale_unavailable".to_string())?;
-    let width = (logical_width * scale).round().max(1.0) as i32;
-    let height = (logical_height * scale).round().max(1.0) as i32;
-    let diameter = (WINDOW_RADIUS_LOGICAL * 2.0 * scale).round().max(2.0) as i32;
-    let native_hwnd = window
-        .hwnd()
-        .map_err(|_| "window_handle_unavailable".to_string())?;
-    let hwnd = HWND(native_hwnd.0);
-
-    unsafe {
-        // Tao keeps caption-related style bits on undecorated top-level windows
-        // and normally suppresses their non-client area through message handling.
-        // A custom region plus blur can make Windows briefly paint that caption
-        // when the window activates, so remove the unused frame bits explicitly.
-        let frame_bits =
-            (WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME).0 as isize;
-        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        if style & frame_bits != 0 {
-            SetWindowLongPtrW(hwnd, GWL_STYLE, style & !frame_bits);
-            SetWindowPos(
-                hwnd,
-                HWND_TOP,
-                0,
-                0,
-                0,
-                0,
-                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
-            )
-            .map_err(|_| "window_frame_failed".to_string())?;
-        }
-
-        // Native Windows backdrops paint the complete HWND. A window region is
-        // therefore required so the blur itself follows the same 24px contour
-        // as the WebView instead of leaking into four rectangular corners.
-        let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
-        if region.0.is_null() {
-            return Err("window_shape_failed".to_string());
-        }
-        if SetWindowRgn(hwnd, region, true) == 0 {
-            let _ = DeleteObject(region);
-            return Err("window_shape_failed".to_string());
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn apply_current_window_shape(window: &tauri::WebviewWindow) -> Result<(), String> {
-    let scale = window
-        .scale_factor()
-        .map_err(|_| "window_scale_unavailable".to_string())?;
-    let size = window
-        .inner_size()
-        .map_err(|_| "window_size_unavailable".to_string())?;
-    apply_rounded_window_region(
-        window,
-        size.width as f64 / scale,
-        size.height as f64 / scale,
-    )
-}
-
-#[tauri::command]
 fn window_effect_mode() -> &'static str {
-    #[cfg(target_os = "windows")]
-    {
-        if system_transparency_enabled() {
-            "blur"
-        } else {
-            "transparent"
-        }
-    }
+    "transparent"
+}
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        "transparent"
+fn should_auto_show_window(
+    has_key: bool,
+    claude_running: bool,
+    onboarding: bool,
+    onboarding_dismissed: bool,
+) -> bool {
+    if onboarding || !has_key {
+        !onboarding_dismissed
+    } else {
+        claude_running
     }
 }
 
@@ -968,10 +808,6 @@ pub fn run() {
             set_window_mode,
             window_effect_mode,
             read_active_model,
-            claude_code_running,
-            enable_autostart,
-            disable_autostart,
-            is_autostart_enabled,
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
@@ -983,49 +819,12 @@ pub fn run() {
                 let _ = window.hide();
                 let _ = window.unminimize();
 
-                #[cfg(target_os = "windows")]
-                if system_transparency_enabled() {
-                    use tauri::window::{Effect, EffectsBuilder};
-
-                    let _ = window.set_effects(EffectsBuilder::new().effect(Effect::Blur).build());
-                }
-
                 let (initial_width, initial_height) = if has_key {
                     (360.0, 244.0)
                 } else {
                     (360.0, 372.0)
                 };
                 let _ = window.set_size(tauri::LogicalSize::new(initial_width, initial_height));
-
-                #[cfg(target_os = "windows")]
-                let _ = apply_rounded_window_region(&window, initial_width, initial_height);
-
-                #[cfg(target_os = "windows")]
-                {
-                    let shape_window = window.clone();
-                    window.on_window_event(move |event| match event {
-                        tauri::WindowEvent::ScaleFactorChanged {
-                            scale_factor,
-                            new_inner_size,
-                            ..
-                        } => {
-                            let logical_width = new_inner_size.width as f64 / scale_factor;
-                            let logical_height = new_inner_size.height as f64 / scale_factor;
-                            let _ = apply_rounded_window_region(
-                                &shape_window,
-                                logical_width,
-                                logical_height,
-                            );
-                        }
-                        tauri::WindowEvent::Resized(_) => {
-                            let _ = apply_current_window_shape(&shape_window);
-                        }
-                        tauri::WindowEvent::Focused(true) => {
-                            let _ = apply_current_window_shape(&shape_window);
-                        }
-                        _ => {}
-                    });
-                }
 
                 let monitor_size = window.primary_monitor().ok().flatten().map(|monitor| {
                     let size = monitor.size();
@@ -1047,16 +846,15 @@ pub fn run() {
                 }
 
                 let claude_running = is_claude_code_running();
-                if !has_key || claude_running {
+                if should_auto_show_window(has_key, claude_running, !has_key, false) {
                     let _ = window.show();
-                    #[cfg(target_os = "windows")]
-                    let _ = apply_current_window_shape(&window);
                 }
 
                 std::thread::spawn({
                     let window = window.clone();
                     let selected_provider = Arc::clone(&state.selected_provider);
                     let onboarding = Arc::clone(&state.onboarding);
+                    let onboarding_dismissed = Arc::clone(&state.onboarding_dismissed);
                     let mut was_running = claude_running;
                     let mut was_onboarding = !has_key;
                     move || loop {
@@ -1065,14 +863,20 @@ pub fn run() {
                             .lock()
                             .map(|selected| *selected)
                             .unwrap_or_else(|_| active_provider());
-                        let requires_onboarding =
-                            onboarding.load(Ordering::Acquire) || get_api_key(provider).is_none();
+                        let has_key = get_api_key(provider).is_some();
+                        let requires_onboarding = onboarding.load(Ordering::Acquire) || !has_key;
+                        let onboarding_was_dismissed = onboarding_dismissed.load(Ordering::Acquire);
                         let is_running = is_claude_code_running();
 
                         if requires_onboarding {
-                            let _ = window.show();
-                            #[cfg(target_os = "windows")]
-                            let _ = apply_current_window_shape(&window);
+                            if should_auto_show_window(
+                                has_key,
+                                is_running,
+                                true,
+                                onboarding_was_dismissed,
+                            ) {
+                                let _ = window.show();
+                            }
                             was_onboarding = true;
                             was_running = is_running;
                             continue;
@@ -1081,8 +885,6 @@ pub fn run() {
                         if was_onboarding || is_running != was_running {
                             if is_running {
                                 let _ = window.show();
-                                #[cfg(target_os = "windows")]
-                                let _ = apply_current_window_shape(&window);
                             } else {
                                 let _ = window.hide();
                             }
@@ -1134,6 +936,14 @@ mod tests {
             resolve_provider(Some("unsupported")),
             Err("invalid_provider".to_string())
         );
+    }
+
+    #[test]
+    fn onboarding_hide_is_respected_until_a_key_exists() {
+        assert!(should_auto_show_window(false, false, true, false));
+        assert!(!should_auto_show_window(false, true, true, true));
+        assert!(!should_auto_show_window(true, false, false, true));
+        assert!(should_auto_show_window(true, true, false, true));
     }
 
     #[cfg(target_os = "windows")]

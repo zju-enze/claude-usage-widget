@@ -193,3 +193,11 @@ test("provider picker is keyboard-oriented and DOM writes stay text-only", async
   assert.ok(!main.includes("innerHTML"));
   assert.ok(!html.includes("<script>") && !html.includes("javascript:"));
 });
+
+test("switching to an already connected provider refreshes immediately", async () => {
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  const main = await fs.readFile(path.join(process.cwd(), "src", "main.js"), "utf8");
+
+  assert.match(main, /if \(state\.has_key\) \{[\s\S]{0,220}await refresh\(\);/);
+});
