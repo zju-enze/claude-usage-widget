@@ -3,8 +3,9 @@
   --text-primary: rgba(255, 255, 255, 0.96);
   --text-secondary: rgba(238, 245, 255, 0.72);
   --text-muted: rgba(226, 237, 252, 0.54);
-  --glass-surface: rgba(15, 20, 29, 0.72);
-  --glass-fallback: rgba(22, 27, 38, 0.96);
+  --glass-surface: rgba(15, 20, 29, 0.68);
+  --glass-fallback: rgba(15, 20, 29, 0.82);
+  --setup-card-surface: rgba(15, 20, 29, 0.88);
   --glass-border: rgba(255, 255, 255, 0.18);
   --glass-border-strong: rgba(255, 255, 255, 0.34);
   --glass-highlight: rgba(255, 255, 255, 0.16);
@@ -14,8 +15,8 @@
   --track-surface: rgba(255, 255, 255, 0.10);
   --panel-surface: rgba(255, 255, 255, 0.055);
   --setup-overlay: rgba(7, 10, 16, 0.56);
-  --ambient-start: rgba(43, 57, 78, 0.80);
-  --ambient-end: rgba(14, 19, 29, 0.90);
+  --ambient-start: rgba(43, 57, 78, 0.14);
+  --ambient-end: rgba(14, 19, 29, 0.22);
   --ambient-cool: rgba(89, 179, 255, 0.19);
   --ambient-warm: rgba(113, 244, 200, 0.12);
   --accent-cool: #75dcff;
@@ -37,8 +38,9 @@
     --text-primary: rgba(17, 25, 38, 0.94);
     --text-secondary: rgba(24, 36, 54, 0.68);
     --text-muted: rgba(32, 48, 70, 0.52);
-    --glass-surface: rgba(241, 247, 255, 0.76);
-    --glass-fallback: rgba(240, 245, 252, 0.97);
+    --glass-surface: rgba(241, 247, 255, 0.70);
+    --glass-fallback: rgba(240, 245, 252, 0.84);
+    --setup-card-surface: rgba(246, 250, 255, 0.90);
     --glass-border: rgba(255, 255, 255, 0.74);
     --glass-border-strong: rgba(255, 255, 255, 0.94);
     --glass-highlight: rgba(255, 255, 255, 0.68);
@@ -48,11 +50,27 @@
     --track-surface: rgba(29, 49, 76, 0.10);
     --panel-surface: rgba(255, 255, 255, 0.34);
     --setup-overlay: rgba(224, 233, 245, 0.58);
-    --ambient-start: rgba(238, 245, 255, 0.88);
-    --ambient-end: rgba(207, 220, 238, 0.86);
+    --ambient-start: rgba(238, 245, 255, 0.12);
+    --ambient-end: rgba(207, 220, 238, 0.20);
     --ambient-cool: rgba(64, 167, 255, 0.19);
     --ambient-warm: rgba(53, 204, 154, 0.13);
     --focus: #1268bb;
+  }
+}
+
+:root[data-window-effect="acrylic"] {
+  --glass-surface: rgba(15, 20, 29, 0.32);
+  --glass-fallback: rgba(15, 20, 29, 0.62);
+  --ambient-start: rgba(43, 57, 78, 0.08);
+  --ambient-end: rgba(14, 19, 29, 0.14);
+}
+
+@media (prefers-color-scheme: light) {
+  :root[data-window-effect="acrylic"] {
+    --glass-surface: rgba(241, 247, 255, 0.34);
+    --glass-fallback: rgba(240, 245, 252, 0.64);
+    --ambient-start: rgba(238, 245, 255, 0.08);
+    --ambient-end: rgba(207, 220, 238, 0.14);
   }
 }
 
@@ -129,8 +147,8 @@ button {
 @supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
   #widget::after {
     background: var(--glass-surface);
-    -webkit-backdrop-filter: blur(30px) saturate(150%);
-    backdrop-filter: blur(30px) saturate(150%);
+    -webkit-backdrop-filter: blur(18px) saturate(135%);
+    backdrop-filter: blur(18px) saturate(135%);
   }
 }
 
@@ -608,7 +626,7 @@ main.is-stale {
   padding: 11px 14px 10px;
   overflow: auto;
   color: var(--text-primary);
-  background: var(--glass-surface);
+  background: var(--setup-card-surface);
   border: 1px solid var(--glass-border-strong);
   border-radius: 20px;
   box-shadow:

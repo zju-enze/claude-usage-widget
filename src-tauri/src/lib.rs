@@ -661,6 +661,34 @@ fn is_claude_code_running() -> bool {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn system_transparency_enabled() -> bool {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        .and_then(|personalize| personalize.get_value::<u32, _>("EnableTransparency"))
+        .is_ok_and(|value| value != 0)
+}
+
+#[tauri::command]
+fn window_effect_mode() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        if system_transparency_enabled() {
+            "acrylic"
+        } else {
+            "transparent"
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        "transparent"
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let client = build_http_client().expect("failed to build the HTTPS client");
@@ -674,12 +702,21 @@ pub fn run() {
             open_help_page,
             hide_main_window,
             set_window_mode,
+            window_effect_mode,
             read_active_model,
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.hide();
                 let _ = window.unminimize();
+
+                #[cfg(target_os = "windows")]
+                if system_transparency_enabled() {
+                    use tauri::window::{Effect, EffectsBuilder};
+
+                    let _ =
+                        window.set_effects(EffectsBuilder::new().effect(Effect::Acrylic).build());
+                }
 
                 let monitor_size = window.primary_monitor().ok().flatten().map(|monitor| {
                     let size = monitor.size();

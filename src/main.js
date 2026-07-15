@@ -207,6 +207,21 @@ async function loadActiveModel() {
   }
 }
 
+async function loadWindowEffectMode() {
+  let mode = "preview";
+  if (hasNativeBridge) {
+    try {
+      const nativeMode = await invoke("window_effect_mode");
+      if (nativeMode === "acrylic" || nativeMode === "transparent") {
+        mode = nativeMode;
+      }
+    } catch {
+      mode = "transparent";
+    }
+  }
+  document.documentElement.dataset.windowEffect = mode;
+}
+
 async function refresh() {
   if (!hasNativeBridge) {
     setConnectionState("offline");
@@ -540,6 +555,7 @@ function setupInteractions() {
 
 async function init() {
   setupInteractions();
+  await loadWindowEffectMode();
   clearUsage("等待首次同步");
   setConnectionState("idle");
   await loadActiveModel();
