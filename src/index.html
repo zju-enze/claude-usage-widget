@@ -116,6 +116,42 @@
           <h1 class="setup-title" id="setup-title">连接 MiniMax</h1>
           <p class="setup-description" id="setup-description">输入你的 MiniMax API Key，以读取 Coding Plan 用量。</p>
 
+          <div
+            class="provider-picker"
+            id="provider-picker"
+            role="radiogroup"
+            aria-label="选择用量服务"
+            aria-describedby="provider-picker-hint setup-provider-state"
+            aria-busy="false"
+          >
+            <button
+              class="provider-option is-selected"
+              type="button"
+              role="radio"
+              data-provider="minimax"
+              aria-checked="true"
+              tabindex="0"
+            >MiniMax</button>
+            <button
+              class="provider-option"
+              type="button"
+              role="radio"
+              data-provider="deepseek"
+              aria-checked="false"
+              tabindex="-1"
+            >DeepSeek</button>
+            <button
+              class="provider-option"
+              type="button"
+              role="radio"
+              data-provider="zhipu"
+              aria-checked="false"
+              tabindex="-1"
+            >智谱</button>
+          </div>
+          <p class="sr-only" id="provider-picker-hint">使用左右方向键切换服务</p>
+          <p class="setup-provider-state" id="setup-provider-state" aria-live="polite">正在检测连接状态…</p>
+
           <label class="setup-label" id="setup-key-label" for="setup-key-input">MiniMax API Key</label>
           <div class="setup-input-row">
             <input

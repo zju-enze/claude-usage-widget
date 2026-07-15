@@ -1,12 +1,13 @@
 import {
   TIME_ZONE,
   isPlausibleProviderKey,
-  normalizeProviderUsage,
 } from "./usage-utils.js";
 
 const nativeInvoke = globalThis.__TAURI__?.core?.invoke;
 const hasNativeBridge = typeof nativeInvoke === "function";
 const REFRESH_MS = 30_000;
+const PROVIDER_STORAGE_KEY = "claude-usage-widget.selected-provider";
+const PROVIDER_IDS = Object.freeze(["minimax", "deepseek", "zhipu"]);
 
 const PROVIDERS = {
   minimax: {
@@ -45,6 +46,7 @@ const ERROR_MESSAGES = {
   response_too_large: "服务响应异常，请稍后重试",
   invalid_response: "收到无法识别的用量数据",
   network: "网络连接失败，点击刷新重试",
+  timeout: "请求超时，点击刷新重试",
   no_usage: "当前账户暂无可用用量数据",
   storage_error: "本机加密保存失败",
   storage_unsupported: "此平台不支持安全保存，请改用环境变量",
@@ -64,6 +66,9 @@ let keySource = "missing";
 let hasSavedKey = false;
 let setupMode = "initial";
 let currentProvider = "minimax";
+let providerRevision = 0;
+let providerSwitchInFlight = false;
+let setupSubmitInFlight = false;
 let collapsed = false;
 let clearConfirmTimer = null;
 let setupReturnFocus = null;
@@ -80,10 +85,82 @@ function friendlyError(code) {
   return ERROR_MESSAGES[code] ?? "操作未完成，请重试";
 }
 
-function applyProvider(provider) {
-  if (!PROVIDERS[provider] || provider === currentProvider) return;
+function isKnownProvider(provider) {
+  return typeof provider === "string" && PROVIDER_IDS.includes(provider);
+}
+
+function readStoredProvider() {
+  try {
+    const provider = localStorage.getItem(PROVIDER_STORAGE_KEY);
+    if (provider == null) return null;
+    if (isKnownProvider(provider)) return provider;
+    localStorage.removeItem(PROVIDER_STORAGE_KEY);
+  } catch {
+    // Storage can be unavailable in private or hardened WebView contexts.
+  }
+  return null;
+}
+
+function persistProvider(provider) {
+  if (!isKnownProvider(provider)) return false;
+  try {
+    localStorage.setItem(PROVIDER_STORAGE_KEY, provider);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function providerButtons() {
+  return Array.from(document.querySelectorAll(".provider-option[data-provider]"));
+}
+
+function renderProviderPicker({ focus = false } = {}) {
+  for (const button of providerButtons()) {
+    const selected = button.dataset.provider === currentProvider;
+    button.classList.toggle("is-selected", selected);
+    button.setAttribute("aria-checked", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+    if (selected && focus) button.focus();
+  }
+}
+
+function setupSourceSummary() {
+  const name = PROVIDERS[currentProvider].name;
+  if (providerSwitchInFlight) return `正在检测 ${name} 的连接状态…`;
+  if (keySource === "env") {
+    return hasSavedKey ? "环境变量已连接 · 本机另有备用 Key" : "环境变量已连接";
+  }
+  if (keySource === "saved") return "本机加密 Key · 已保存并连接";
+  if (hasSavedKey) return "本机已有 Key · 当前需要更新";
+  return "尚未连接";
+}
+
+function syncSetupControlState() {
+  const picker = $("provider-picker");
+  if (!picker) return;
+  const busy = providerSwitchInFlight || setupSubmitInFlight;
+  picker.setAttribute("aria-busy", String(providerSwitchInFlight));
+  for (const button of providerButtons()) button.disabled = busy;
+
+  const usesEnvironment = keySource === "env";
+  $("setup-key-input").disabled = usesEnvironment || busy;
+  $("setup-toggle-key").disabled = usesEnvironment || busy;
+  $("setup-submit").disabled = busy;
+  $("setup-provider-state").textContent = setupSourceSummary();
+}
+
+function applyProvider(provider, { persist = false } = {}) {
+  if (!isKnownProvider(provider)) return false;
+  const changed = provider !== currentProvider;
   currentProvider = provider;
-  if ($("five-hour-label")) clearUsage("等待首次同步");
+  if (persist) persistProvider(provider);
+  if (changed) {
+    providerRevision += 1;
+    if ($("five-hour-label")) clearUsage("等待首次同步");
+  }
+  renderProviderPicker();
+  return true;
 }
 
 function errorCode(error) {
@@ -332,21 +409,29 @@ async function refresh() {
   if (refreshInFlight) return;
 
   refreshInFlight = true;
+  const requestedProvider = currentProvider;
+  const refreshRevision = providerRevision;
   setConnectionState("loading");
   let finalState = "error";
   let finalMessage = "连接异常";
   let shouldOpenSetup = false;
 
   try {
-    const snapshot = await invoke("fetch_usage");
-    applyProvider(snapshot?.provider);
+    const snapshot = await invoke("fetch_usage", { provider: requestedProvider });
+    if (refreshRevision !== providerRevision) return;
+    if (!snapshot || snapshot.provider !== requestedProvider) {
+      throw usageError("invalid_response");
+    }
     if (!snapshot?.found) throw usageError(snapshot?.error || "invalid_response");
 
-    keySource = snapshot.key_source || keySource;
-    const usage = normalizeProviderUsage(currentProvider, snapshot.raw);
-    if (!usage?.metrics?.length) throw usageError("no_usage");
-    paintMetric(0, usage.metrics[0]);
-    paintMetric(1, usage.metrics[1]);
+    keySource = snapshot.key_source === "env" || snapshot.key_source === "saved"
+      ? snapshot.key_source
+      : keySource;
+    if (!Array.isArray(snapshot.metrics) || snapshot.metrics.length < 2) {
+      throw usageError("no_usage");
+    }
+    paintMetric(0, snapshot.metrics[0]);
+    paintMetric(1, snapshot.metrics[1]);
 
     const fetchedAt = new Date(snapshot.fetched_at);
     lastUpdatedAt = Number.isNaN(fetchedAt.getTime()) ? new Date() : fetchedAt;
@@ -361,7 +446,7 @@ async function refresh() {
     shouldOpenSetup = lastErrorCode === "missing_key";
   } finally {
     refreshInFlight = false;
-    setConnectionState(finalState, finalMessage);
+    if (refreshRevision === providerRevision) setConnectionState(finalState, finalMessage);
   }
 
   if (shouldOpenSetup) {
@@ -403,14 +488,104 @@ function resetClearConfirmation() {
   button.classList.remove("is-danger");
 }
 
+function renderSetupContent(source = keySource, { resetInput = true } = {}) {
+  keySource = source === "env" || source === "saved" ? source : "missing";
+  const profile = PROVIDERS[currentProvider];
+  const input = $("setup-key-input");
+  const toggle = $("setup-toggle-key");
+  const submit = $("setup-submit");
+  const clear = $("setup-clear");
+  const cancel = $("setup-cancel");
+
+  $("setup-error").textContent = "";
+  input.setAttribute("aria-invalid", "false");
+  if (resetInput) {
+    input.value = "";
+    input.type = "password";
+  }
+  input.placeholder = profile.placeholder;
+  $("setup-key-label").textContent = `${profile.name} API Key`;
+  toggle.textContent = input.type === "password" ? "显示" : "隐藏";
+  toggle.setAttribute("aria-label", `${toggle.textContent} API Key`);
+
+  const usesEnvironment = keySource === "env";
+  $("setup-title").textContent = usesEnvironment
+    ? `${profile.name} 环境变量已连接`
+    : setupMode === "initial" ? `连接 ${profile.name}` : `更新 ${profile.name} 连接`;
+  $("setup-description").textContent = usesEnvironment
+    ? "当前 Key 由系统环境变量提供。为避免来源冲突，请在环境变量中修改或移除。"
+    : profile.description;
+  $("setup-security").textContent = usesEnvironment
+    ? profile.environment
+    : profile.security;
+
+  submit.classList.toggle("hidden", usesEnvironment);
+  clear.dataset.defaultLabel = usesEnvironment
+    ? "移除本机备用密钥"
+    : "移除本机密钥";
+  resetClearConfirmation();
+  clear.classList.toggle("hidden", !hasSavedKey);
+  cancel.textContent = setupMode === "initial" ? "隐藏小组件" : "返回";
+
+  renderProviderPicker();
+  syncSetupControlState();
+}
+
+async function selectProvider(provider, { focus = true } = {}) {
+  if (!isKnownProvider(provider) || providerSwitchInFlight || setupSubmitInFlight) return;
+  if (provider === currentProvider) {
+    renderProviderPicker({ focus });
+    return;
+  }
+
+  stopPolling();
+  providerSwitchInFlight = true;
+  applyProvider(provider, { persist: true });
+  keySource = "missing";
+  hasSavedKey = false;
+  lastUpdatedAt = null;
+  refreshFailed = false;
+  lastErrorCode = null;
+  clearUsage("正在检测连接");
+  setConnectionState("loading", `检测 ${PROVIDERS[provider].name}`);
+  renderSetupContent("missing");
+  let switchError = null;
+
+  try {
+    if (!hasNativeBridge) throw usageError("native_unavailable");
+    const state = await invoke("probe_state", { provider });
+    if (!state || state.provider !== provider || !isKnownProvider(state.provider)) {
+      throw usageError("invalid_response");
+    }
+
+    keySource = state.source === "env" || state.source === "saved"
+      ? state.source
+      : "missing";
+    hasSavedKey = Boolean(state.has_saved_key);
+    renderSetupContent(keySource);
+    if (state.has_key) {
+      setConnectionState("idle", `${PROVIDERS[provider].name} 已连接`);
+    } else {
+      setConnectionState("warning", `连接 ${PROVIDERS[provider].name}`);
+    }
+  } catch (error) {
+    keySource = "missing";
+    hasSavedKey = false;
+    switchError = friendlyError(errorCode(error));
+    setConnectionState("error", "连接检测失败");
+  } finally {
+    providerSwitchInFlight = false;
+    renderSetupContent(keySource, { resetInput: false });
+    if (switchError) $("setup-error").textContent = switchError;
+    renderProviderPicker({ focus });
+  }
+}
+
 async function showSetup(show, mode = "manage", source = keySource) {
   const overlay = $("setup-overlay");
   const header = $("widget-header");
   const content = $("content");
   const input = $("setup-key-input");
-  const toggle = $("setup-toggle-key");
-  const submit = $("setup-submit");
-  const clear = $("setup-clear");
   const cancel = $("setup-cancel");
   $("widget").classList.toggle("is-setup-open", show);
   if (show) resetLiquidGlass();
@@ -437,37 +612,7 @@ async function showSetup(show, mode = "manage", source = keySource) {
       : null;
   }
   setupMode = mode;
-  keySource = source;
-  const profile = PROVIDERS[currentProvider];
-  $("setup-error").textContent = "";
-  input.setAttribute("aria-invalid", "false");
-  input.value = "";
-  input.type = "password";
-  input.placeholder = profile.placeholder;
-  $("setup-key-label").textContent = `${profile.name} API Key`;
-  toggle.textContent = "显示";
-  toggle.setAttribute("aria-label", "显示 API Key");
-
-  const usesEnvironment = source === "env";
-  $("setup-title").textContent = usesEnvironment
-    ? `${profile.name} 环境变量已连接`
-    : mode === "initial" ? `连接 ${profile.name}` : `更新 ${profile.name} 连接`;
-  $("setup-description").textContent = usesEnvironment
-    ? "当前 Key 由系统环境变量提供。为避免来源冲突，请在环境变量中修改或移除。"
-    : profile.description;
-  $("setup-security").textContent = usesEnvironment
-    ? profile.environment
-    : profile.security;
-
-  input.disabled = usesEnvironment;
-  toggle.disabled = usesEnvironment;
-  submit.classList.toggle("hidden", usesEnvironment);
-  clear.dataset.defaultLabel = usesEnvironment
-    ? "移除本机备用密钥"
-    : "移除本机密钥";
-  resetClearConfirmation();
-  clear.classList.toggle("hidden", !hasSavedKey);
-  cancel.textContent = mode === "initial" ? "隐藏小组件" : "返回";
+  renderSetupContent(source);
 
   overlay.classList.remove("hidden");
   overlay.setAttribute("aria-hidden", "false");
@@ -476,7 +621,7 @@ async function showSetup(show, mode = "manage", source = keySource) {
   await setWindowMode("setup");
 
   window.setTimeout(() => {
-    (usesEnvironment ? cancel : input).focus();
+    (keySource === "env" ? cancel : input).focus();
   }, 80);
 }
 
@@ -496,10 +641,12 @@ async function submitSetup(event) {
     return;
   }
 
-  submit.disabled = true;
+  const provider = currentProvider;
+  setupSubmitInFlight = true;
+  syncSetupControlState();
   submit.textContent = "正在验证…";
   try {
-    const result = await invoke("save_key_and_test", { key: candidate });
+    const result = await invoke("save_key_and_test", { provider, key: candidate });
     if (!result?.ok) throw usageError(result?.error || "storage_error");
 
     keySource = "saved";
@@ -512,7 +659,8 @@ async function submitSetup(event) {
     errorElement.textContent = friendlyError(code);
     input.setAttribute("aria-invalid", "true");
   } finally {
-    submit.disabled = false;
+    setupSubmitInFlight = false;
+    syncSetupControlState();
     submit.textContent = "验证并保存";
   }
 }
@@ -520,8 +668,8 @@ async function submitSetup(event) {
 async function manageKey() {
   let source = keySource;
   try {
-    const state = await invoke("probe_state");
-    applyProvider(state?.provider);
+    const state = await invoke("probe_state", { provider: currentProvider });
+    if (!state || state.provider !== currentProvider) throw usageError("invalid_response");
     source = state?.source || source;
     hasSavedKey = Boolean(state?.has_saved_key);
   } catch {
@@ -542,7 +690,7 @@ async function clearSavedKey() {
 
   button.disabled = true;
   try {
-    await invoke("clear_key");
+    await invoke("clear_key", { provider: currentProvider });
     hasSavedKey = false;
     if (keySource === "env") {
       await showSetup(true, "manage", "env");
@@ -599,6 +747,30 @@ function setupInteractions() {
   $("setup-form").addEventListener("submit", submitSetup);
   $("setup-clear").addEventListener("click", clearSavedKey);
 
+  $("provider-picker").addEventListener("click", (event) => {
+    const button = event.target instanceof Element
+      ? event.target.closest(".provider-option[data-provider]")
+      : null;
+    if (!(button instanceof HTMLButtonElement)) return;
+    void selectProvider(button.dataset.provider, { focus: true });
+  });
+
+  $("provider-picker").addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    const buttons = providerButtons();
+    if (buttons.length === 0) return;
+    event.preventDefault();
+
+    const activeIndex = Math.max(0, buttons.indexOf(document.activeElement));
+    let nextIndex = activeIndex;
+    if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = buttons.length - 1;
+    else if (event.key === "ArrowLeft") nextIndex = (activeIndex - 1 + buttons.length) % buttons.length;
+    else nextIndex = (activeIndex + 1) % buttons.length;
+
+    void selectProvider(buttons[nextIndex].dataset.provider, { focus: true });
+  });
+
   $("setup-toggle-key").addEventListener("click", () => {
     const input = $("setup-key-input");
     const reveal = input.type === "password";
@@ -610,7 +782,7 @@ function setupInteractions() {
 
   $("setup-help").addEventListener("click", async () => {
     try {
-      await invoke("open_help_page");
+      await invoke("open_help_page", { provider: currentProvider });
     } catch {
       $("setup-error").textContent = friendlyError("open_failed");
     }
@@ -646,6 +818,9 @@ function setupInteractions() {
 
 async function init() {
   setupInteractions();
+  const storedProvider = readStoredProvider();
+  if (storedProvider) applyProvider(storedProvider);
+  else renderProviderPicker();
   await loadWindowEffectMode();
   clearUsage("等待首次同步");
   setConnectionState("idle");
@@ -658,9 +833,13 @@ async function init() {
   }
 
   try {
-    const state = await invoke("probe_state");
-    applyProvider(state?.provider);
-    keySource = state?.source || "missing";
+    const state = await invoke("probe_state", { provider: storedProvider });
+    if (!state || !applyProvider(state.provider, { persist: true })) {
+      throw usageError("invalid_response");
+    }
+    keySource = state.source === "env" || state.source === "saved"
+      ? state.source
+      : "missing";
     hasSavedKey = Boolean(state?.has_saved_key);
     if (!state?.has_key) {
       setConnectionState("warning", "等待连接");

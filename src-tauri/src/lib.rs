@@ -2,10 +2,14 @@ mod providers;
 
 use providers::{
     build_http_client, is_valid_api_key, provider_from_base_url, provider_from_model,
-    request_usage, Provider,
+    request_usage, Provider, UsageMetric,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::time::Duration;
 use tauri::Manager;
 use zeroize::{Zeroize, Zeroizing};
@@ -14,7 +18,7 @@ use zeroize::{Zeroize, Zeroizing};
 struct UsageSnapshot {
     found: bool,
     error: Option<String>,
-    raw: serde_json::Value,
+    metrics: Vec<UsageMetric>,
     fetched_at: String,
     key_source: String,
     provider: String,
@@ -41,7 +45,21 @@ struct ActiveModelInfo {
     source: String,
 }
 
-struct ApiClient(reqwest::Client);
+struct AppState {
+    client: reqwest::Client,
+    selected_provider: Arc<Mutex<Provider>>,
+    onboarding: Arc<AtomicBool>,
+}
+
+impl AppState {
+    fn new(client: reqwest::Client, provider: Provider, onboarding: bool) -> Self {
+        Self {
+            client,
+            selected_provider: Arc::new(Mutex::new(provider)),
+            onboarding: Arc::new(AtomicBool::new(onboarding)),
+        }
+    }
+}
 
 struct ApiKey {
     value: Zeroizing<String>,
@@ -114,6 +132,49 @@ fn configured_base_url() -> Option<String> {
     configuration_value("ANTHROPIC_BASE_URL")
 }
 
+const MODEL_CONFIGURATION_NAMES: [&str; 7] = [
+    "MINIMAX_MODEL",
+    "DEEPSEEK_MODEL",
+    "ZAI_MODEL",
+    "ZHIPUAI_MODEL",
+    "ANTHROPIC_MODEL",
+    "CLAUDE_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+];
+
+fn active_model_info() -> ActiveModelInfo {
+    for name in MODEL_CONFIGURATION_NAMES {
+        if let Some(value) = configuration_value(name) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return ActiveModelInfo {
+                    model: Some(trimmed.to_string()),
+                    source: "env".to_string(),
+                };
+            }
+        }
+    }
+
+    if let Some(home) = user_home() {
+        for filename in ["settings.local.json", "settings.json"] {
+            let path = home.join(".claude").join(filename);
+            if let Ok(contents) = fs::read_to_string(path) {
+                if let Some(model) = extract_model_from_claude_settings(&contents) {
+                    return ActiveModelInfo {
+                        model: Some(model),
+                        source: "config".to_string(),
+                    };
+                }
+            }
+        }
+    }
+
+    ActiveModelInfo {
+        model: None,
+        source: "none".to_string(),
+    }
+}
+
 fn active_provider() -> Provider {
     if let Some(provider) = configured_base_url()
         .as_deref()
@@ -122,20 +183,12 @@ fn active_provider() -> Provider {
         return provider;
     }
 
-    for name in [
-        "ANTHROPIC_MODEL",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL",
-        "MINIMAX_MODEL",
-        "DEEPSEEK_MODEL",
-        "ZAI_MODEL",
-        "ZHIPUAI_MODEL",
-    ] {
-        if let Some(provider) = configuration_value(name)
-            .as_deref()
-            .and_then(provider_from_model)
-        {
-            return provider;
-        }
+    if let Some(provider) = active_model_info()
+        .model
+        .as_deref()
+        .and_then(provider_from_model)
+    {
+        return provider;
     }
 
     // Keep MiniMax first for backward compatibility if several unrelated provider keys coexist.
@@ -150,6 +203,27 @@ fn active_provider() -> Provider {
     }
 
     Provider::Minimax
+}
+
+fn resolve_provider(provider: Option<&str>) -> Result<Provider, String> {
+    match provider {
+        Some(id) => Provider::from_id(id).ok_or_else(|| "invalid_provider".to_string()),
+        None => Ok(active_provider()),
+    }
+}
+
+fn select_provider(state: &AppState, provider: Provider) {
+    if let Ok(mut selected) = state.selected_provider.lock() {
+        *selected = provider;
+    }
+}
+
+fn selected_provider(state: &AppState) -> Provider {
+    state
+        .selected_provider
+        .lock()
+        .map(|selected| *selected)
+        .unwrap_or_else(|_| active_provider())
 }
 
 fn environment_api_key(provider: Provider) -> Option<ApiKey> {
@@ -278,11 +352,11 @@ mod windows_crypto {
     };
     use zeroize::{Zeroize, Zeroizing};
 
-    pub const CRYPTPROTECT_DATA_HEADER: [u8; 4] = [b'C', b'T', b'W', b'P'];
+    pub const CRYPTPROTECT_DATA_HEADER: [u8; 4] = *b"CTWP";
     const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
 
     pub fn encrypt(plaintext: &[u8]) -> Result<Vec<u8>, String> {
-        let mut input = CRYPT_INTEGER_BLOB {
+        let input = CRYPT_INTEGER_BLOB {
             cbData: plaintext.len() as u32,
             pbData: plaintext.as_ptr() as *mut u8,
         };
@@ -293,7 +367,7 @@ mod windows_crypto {
 
         unsafe {
             CryptProtectData(
-                &mut input,
+                &input,
                 None,
                 None,
                 None,
@@ -330,7 +404,7 @@ mod windows_crypto {
         let payload = blob
             .strip_prefix(&CRYPTPROTECT_DATA_HEADER)
             .ok_or_else(|| "invalid DPAPI header".to_string())?;
-        let mut input = CRYPT_INTEGER_BLOB {
+        let input = CRYPT_INTEGER_BLOB {
             cbData: payload.len() as u32,
             pbData: payload.as_ptr() as *mut u8,
         };
@@ -341,7 +415,7 @@ mod windows_crypto {
 
         unsafe {
             CryptUnprotectData(
-                &mut input,
+                &input,
                 None,
                 None,
                 None,
@@ -374,14 +448,19 @@ mod windows_crypto {
 }
 
 #[tauri::command]
-async fn fetch_usage(client: tauri::State<'_, ApiClient>) -> Result<UsageSnapshot, String> {
-    let provider = active_provider();
+async fn fetch_usage(
+    state: tauri::State<'_, AppState>,
+    provider: Option<String>,
+) -> Result<UsageSnapshot, String> {
+    let provider = resolve_provider(provider.as_deref())?;
+    select_provider(&state, provider);
     let fetched_at = chrono::Utc::now().to_rfc3339();
     let Some(key) = get_api_key(provider) else {
+        state.onboarding.store(true, Ordering::Release);
         return Ok(UsageSnapshot {
             found: false,
             error: Some("missing_key".to_string()),
-            raw: serde_json::json!({}),
+            metrics: Vec::new(),
             fetched_at,
             key_source: "missing".to_string(),
             provider: provider.id().to_string(),
@@ -391,11 +470,18 @@ async fn fetch_usage(client: tauri::State<'_, ApiClient>) -> Result<UsageSnapsho
     let key_source = key.source.to_string();
     let base_url = configured_base_url();
     Ok(
-        match request_usage(&client.0, provider, key.value.as_str(), base_url.as_deref()).await {
-            Ok(raw) => UsageSnapshot {
+        match request_usage(
+            &state.client,
+            provider,
+            key.value.as_str(),
+            base_url.as_deref(),
+        )
+        .await
+        {
+            Ok(data) => UsageSnapshot {
                 found: true,
                 error: None,
-                raw,
+                metrics: data.metrics.into_iter().collect(),
                 fetched_at,
                 key_source,
                 provider: provider.id().to_string(),
@@ -403,7 +489,7 @@ async fn fetch_usage(client: tauri::State<'_, ApiClient>) -> Result<UsageSnapsho
             Err(error) => UsageSnapshot {
                 found: false,
                 error: Some(error.code().to_string()),
-                raw: serde_json::json!({}),
+                metrics: Vec::new(),
                 fetched_at,
                 key_source,
                 provider: provider.id().to_string(),
@@ -413,10 +499,14 @@ async fn fetch_usage(client: tauri::State<'_, ApiClient>) -> Result<UsageSnapsho
 }
 
 #[tauri::command]
-fn probe_state() -> ProbeState {
-    let provider = active_provider();
+fn probe_state(
+    state: tauri::State<'_, AppState>,
+    provider: Option<String>,
+) -> Result<ProbeState, String> {
+    let provider = resolve_provider(provider.as_deref())?;
+    select_provider(&state, provider);
     let has_saved_key = saved_key_exists(provider);
-    match get_api_key(provider) {
+    let probe = match get_api_key(provider) {
         Some(key) => ProbeState {
             has_key: true,
             has_saved_key,
@@ -431,7 +521,11 @@ fn probe_state() -> ProbeState {
             provider: provider.id().to_string(),
             provider_name: provider.display_name().to_string(),
         },
+    };
+    if !probe.has_key {
+        state.onboarding.store(true, Ordering::Release);
     }
+    Ok(probe)
 }
 
 #[cfg(target_os = "windows")]
@@ -446,10 +540,15 @@ fn saved_key_exists(_provider: Provider) -> bool {
 
 #[tauri::command]
 async fn save_key_and_test(
-    client: tauri::State<'_, ApiClient>,
+    state: tauri::State<'_, AppState>,
+    provider: String,
     key: String,
 ) -> Result<SaveResult, String> {
-    let provider = active_provider();
+    let provider = resolve_provider(Some(&provider))?;
+    select_provider(&state, provider);
+    state
+        .onboarding
+        .store(get_api_key(provider).is_none(), Ordering::Release);
     let mut key = Zeroizing::new(key);
     let candidate = Zeroizing::new(key.trim().to_string());
     key.zeroize();
@@ -461,8 +560,13 @@ async fn save_key_and_test(
     }
 
     let base_url = configured_base_url();
-    if let Err(error) =
-        request_usage(&client.0, provider, candidate.as_str(), base_url.as_deref()).await
+    if let Err(error) = request_usage(
+        &state.client,
+        provider,
+        candidate.as_str(),
+        base_url.as_deref(),
+    )
+    .await
     {
         return Ok(SaveResult {
             ok: false,
@@ -487,6 +591,7 @@ async fn save_key_and_test(
             });
         }
 
+        state.onboarding.store(false, Ordering::Release);
         Ok(SaveResult {
             ok: true,
             error: None,
@@ -495,17 +600,22 @@ async fn save_key_and_test(
 }
 
 #[tauri::command]
-fn clear_key() -> Result<(), String> {
-    let path = keystore::key_path(active_provider().key_filename());
+fn clear_key(state: tauri::State<'_, AppState>, provider: String) -> Result<(), String> {
+    let provider = resolve_provider(Some(&provider))?;
+    select_provider(&state, provider);
+    let path = keystore::key_path(provider.key_filename());
     if path.exists() {
         fs::remove_file(path).map_err(|_| "remove_failed".to_string())?;
     }
+    state.onboarding.store(true, Ordering::Release);
     Ok(())
 }
 
 #[tauri::command]
-fn open_help_page() -> Result<(), String> {
-    open::that_detached(active_provider().help_url()).map_err(|_| "open_failed".to_string())
+fn open_help_page(state: tauri::State<'_, AppState>, provider: String) -> Result<(), String> {
+    let provider = resolve_provider(Some(&provider))?;
+    select_provider(&state, provider);
+    open::that_detached(provider.help_url()).map_err(|_| "open_failed".to_string())
 }
 
 #[tauri::command]
@@ -525,14 +635,27 @@ enum WindowMode {
 }
 
 #[tauri::command]
-fn set_window_mode(app: tauri::AppHandle, mode: WindowMode) -> Result<(), String> {
+fn set_window_mode(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    mode: WindowMode,
+) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "window_unavailable".to_string())?;
     let (width, height) = match mode {
-        WindowMode::Expanded => (360.0, 244.0),
-        WindowMode::Collapsed => (360.0, 52.0),
-        WindowMode::Setup => (360.0, 328.0),
+        WindowMode::Expanded => {
+            state.onboarding.store(false, Ordering::Release);
+            (360.0, 244.0)
+        }
+        WindowMode::Collapsed => {
+            state.onboarding.store(false, Ordering::Release);
+            (360.0, 52.0)
+        }
+        WindowMode::Setup => {
+            state.onboarding.store(true, Ordering::Release);
+            (360.0, 372.0)
+        }
     };
     window
         .set_size(tauri::LogicalSize::new(width, height))
@@ -546,44 +669,7 @@ fn set_window_mode(app: tauri::AppHandle, mode: WindowMode) -> Result<(), String
 
 #[tauri::command]
 fn read_active_model() -> ActiveModelInfo {
-    for name in [
-        "MINIMAX_MODEL",
-        "DEEPSEEK_MODEL",
-        "ZAI_MODEL",
-        "ZHIPUAI_MODEL",
-        "ANTHROPIC_MODEL",
-        "CLAUDE_MODEL",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL",
-    ] {
-        if let Some(value) = configuration_value(name) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return ActiveModelInfo {
-                    model: Some(trimmed.to_string()),
-                    source: "env".to_string(),
-                };
-            }
-        }
-    }
-
-    if let Some(home) = user_home() {
-        for filename in ["settings.local.json", "settings.json"] {
-            let path = home.join(".claude").join(filename);
-            if let Ok(contents) = fs::read_to_string(path) {
-                if let Some(model) = extract_model_from_claude_settings(&contents) {
-                    return ActiveModelInfo {
-                        model: Some(model),
-                        source: "config".to_string(),
-                    };
-                }
-            }
-        }
-    }
-
-    ActiveModelInfo {
-        model: None,
-        source: "none".to_string(),
-    }
+    active_model_info()
 }
 
 fn extract_model_from_claude_settings(contents: &str) -> Option<String> {
@@ -608,15 +694,7 @@ fn extract_model_from_claude_settings(contents: &str) -> Option<String> {
     }
 
     if let Some(environment) = value.get("env").and_then(|item| item.as_object()) {
-        for name in [
-            "MINIMAX_MODEL",
-            "DEEPSEEK_MODEL",
-            "ZAI_MODEL",
-            "ZHIPUAI_MODEL",
-            "ANTHROPIC_MODEL",
-            "CLAUDE_MODEL",
-            "ANTHROPIC_DEFAULT_SONNET_MODEL",
-        ] {
+        for name in MODEL_CONFIGURATION_NAMES {
             if let Some(model) = environment.get(name).and_then(|item| item.as_str()) {
                 let trimmed = model.trim();
                 if !trimmed.is_empty() {
@@ -678,6 +756,84 @@ fn is_claude_code_running() -> bool {
             }
         }
         false
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+#[tauri::command]
+fn claude_code_running() -> bool {
+    is_claude_code_running()
+}
+
+#[tauri::command]
+fn enable_autostart(_app: tauri::AppHandle) -> Result<bool, String> {
+    #[cfg(target_os = "windows")]
+    {
+        use winreg::enums::{HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE};
+        use winreg::RegKey;
+
+        let executable =
+            std::env::current_exe().map_err(|_| "autostart_executable_unavailable".to_string())?;
+        let value = format!("\"{}\"", executable.display());
+        let run_key = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                KEY_SET_VALUE | KEY_QUERY_VALUE,
+            )
+            .map_err(|_| "autostart_registry_unavailable".to_string())?;
+        run_key
+            .set_value("ClaudeUsageWidget", &value)
+            .map_err(|_| "autostart_enable_failed".to_string())?;
+        Ok(true)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(false)
+    }
+}
+
+#[tauri::command]
+fn disable_autostart() -> Result<bool, String> {
+    #[cfg(target_os = "windows")]
+    {
+        use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
+        use winreg::RegKey;
+
+        let run_key = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                KEY_SET_VALUE,
+            )
+            .map_err(|_| "autostart_registry_unavailable".to_string())?;
+        match run_key.delete_value("ClaudeUsageWidget") {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err("autostart_disable_failed".to_string()),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(false)
+    }
+}
+
+#[tauri::command]
+fn is_autostart_enabled() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use winreg::enums::HKEY_CURRENT_USER;
+        use winreg::RegKey;
+
+        RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
+            .and_then(|run_key| run_key.get_value::<String, _>("ClaudeUsageWidget"))
+            .is_ok()
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -798,8 +954,10 @@ fn window_effect_mode() -> &'static str {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let client = build_http_client().expect("failed to build the HTTPS client");
+    let initial_provider = active_provider();
+    let initial_onboarding = get_api_key(initial_provider).is_none();
     tauri::Builder::default()
-        .manage(ApiClient(client))
+        .manage(AppState::new(client, initial_provider, initial_onboarding))
         .invoke_handler(tauri::generate_handler![
             fetch_usage,
             probe_state,
@@ -810,9 +968,18 @@ pub fn run() {
             set_window_mode,
             window_effect_mode,
             read_active_model,
+            claude_code_running,
+            enable_autostart,
+            disable_autostart,
+            is_autostart_enabled,
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
+                let state = app.state::<AppState>();
+                let provider = selected_provider(&state);
+                let has_key = get_api_key(provider).is_some();
+                state.onboarding.store(!has_key, Ordering::Release);
+
                 let _ = window.hide();
                 let _ = window.unminimize();
 
@@ -823,8 +990,15 @@ pub fn run() {
                     let _ = window.set_effects(EffectsBuilder::new().effect(Effect::Blur).build());
                 }
 
+                let (initial_width, initial_height) = if has_key {
+                    (360.0, 244.0)
+                } else {
+                    (360.0, 372.0)
+                };
+                let _ = window.set_size(tauri::LogicalSize::new(initial_width, initial_height));
+
                 #[cfg(target_os = "windows")]
-                let _ = apply_rounded_window_region(&window, 360.0, 244.0);
+                let _ = apply_rounded_window_region(&window, initial_width, initial_height);
 
                 #[cfg(target_os = "windows")]
                 {
@@ -842,6 +1016,9 @@ pub fn run() {
                                 logical_width,
                                 logical_height,
                             );
+                        }
+                        tauri::WindowEvent::Resized(_) => {
+                            let _ = apply_current_window_shape(&shape_window);
                         }
                         tauri::WindowEvent::Focused(true) => {
                             let _ = apply_current_window_shape(&shape_window);
@@ -869,13 +1046,39 @@ pub fn run() {
                     }
                 }
 
+                let claude_running = is_claude_code_running();
+                if !has_key || claude_running {
+                    let _ = window.show();
+                    #[cfg(target_os = "windows")]
+                    let _ = apply_current_window_shape(&window);
+                }
+
                 std::thread::spawn({
                     let window = window.clone();
-                    let mut was_running = false;
+                    let selected_provider = Arc::clone(&state.selected_provider);
+                    let onboarding = Arc::clone(&state.onboarding);
+                    let mut was_running = claude_running;
+                    let mut was_onboarding = !has_key;
                     move || loop {
-                        std::thread::sleep(Duration::from_secs(5));
+                        std::thread::sleep(Duration::from_secs(10));
+                        let provider = selected_provider
+                            .lock()
+                            .map(|selected| *selected)
+                            .unwrap_or_else(|_| active_provider());
+                        let requires_onboarding =
+                            onboarding.load(Ordering::Acquire) || get_api_key(provider).is_none();
                         let is_running = is_claude_code_running();
-                        if is_running != was_running {
+
+                        if requires_onboarding {
+                            let _ = window.show();
+                            #[cfg(target_os = "windows")]
+                            let _ = apply_current_window_shape(&window);
+                            was_onboarding = true;
+                            was_running = is_running;
+                            continue;
+                        }
+
+                        if was_onboarding || is_running != was_running {
                             if is_running {
                                 let _ = window.show();
                                 #[cfg(target_os = "windows")]
@@ -883,6 +1086,7 @@ pub fn run() {
                             } else {
                                 let _ = window.hide();
                             }
+                            was_onboarding = false;
                             was_running = is_running;
                         }
                     }
@@ -912,6 +1116,23 @@ mod tests {
             extract_model_from_claude_settings(r#"{"env":{"ANTHROPIC_MODEL":"claude-opus"}}"#)
                 .as_deref(),
             Some("claude-opus")
+        );
+        assert_eq!(
+            extract_model_from_claude_settings(r#"{"env":{"CLAUDE_MODEL":"deepseek-chat"}}"#)
+                .as_deref(),
+            Some("deepseek-chat")
+        );
+    }
+
+    #[test]
+    fn explicit_provider_ids_are_strict() {
+        assert_eq!(
+            resolve_provider(Some("deepseek")).expect("known provider"),
+            Provider::Deepseek
+        );
+        assert_eq!(
+            resolve_provider(Some("unsupported")),
+            Err("invalid_provider".to_string())
         );
     }
 

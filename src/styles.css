@@ -712,7 +712,7 @@ main.is-stale {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 10px;
+  padding: 8px;
   background: var(--setup-overlay);
   -webkit-backdrop-filter: blur(22px) saturate(135%);
   backdrop-filter: blur(22px) saturate(135%);
@@ -721,7 +721,7 @@ main.is-stale {
 .setup-card {
   width: 100%;
   max-height: 100%;
-  padding: 11px 14px 10px;
+  padding: 10px 12px 8px;
   overflow: auto;
   color: var(--text-primary);
   background: var(--setup-card-surface);
@@ -753,17 +753,101 @@ main.is-stale {
 
 .setup-title {
   margin-bottom: 3px;
-  font-size: 21px;
+  font-size: 20px;
   font-weight: 720;
   letter-spacing: -0.025em;
   line-height: 1.2;
 }
 
 .setup-description {
-  margin-bottom: 7px;
+  min-height: 32px;
+  margin-bottom: 6px;
   color: var(--text-secondary);
   font-size: 12px;
-  line-height: 1.4;
+  line-height: 1.35;
+}
+
+.provider-picker {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 3px;
+  min-height: 34px;
+  padding: 3px;
+  background: rgba(0, 0, 0, 0.10);
+  border: 1px solid var(--control-border);
+  border-radius: 12px;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+.provider-picker[aria-busy="true"]::after {
+  content: "";
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 5px;
+  height: 5px;
+  background: var(--accent-cool);
+  border-radius: 50%;
+  box-shadow: 0 0 7px rgba(117, 220, 255, 0.75);
+  animation: status-pulse 1s ease-in-out infinite;
+}
+
+.provider-option {
+  min-width: 0;
+  padding: 0 5px;
+  overflow: hidden;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 26px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition:
+    color 150ms ease,
+    background-color 150ms ease,
+    border-color 150ms ease,
+    box-shadow 150ms ease,
+    transform 100ms ease;
+}
+
+.provider-option:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--control-surface);
+}
+
+.provider-option.is-selected {
+  color: var(--text-primary);
+  background: linear-gradient(180deg, var(--control-hover), var(--control-surface));
+  border-color: var(--glass-border);
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    0 2px 8px rgba(0, 0, 0, 0.10);
+}
+
+.provider-option:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+.provider-option:disabled {
+  cursor: wait;
+  opacity: 0.52;
+}
+
+.setup-provider-state {
+  min-height: 16px;
+  margin: 3px 1px 2px;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .setup-label {
@@ -782,7 +866,7 @@ main.is-stale {
 
 .setup-input,
 .input-action {
-  height: 38px;
+  height: 36px;
   color: var(--text-primary);
   background: var(--control-surface);
   border: 1px solid var(--control-border);
@@ -814,15 +898,15 @@ main.is-stale {
 }
 
 .setup-security {
-  margin-top: 6px;
+  margin-top: 5px;
   color: var(--text-muted);
   font-size: 12px;
-  line-height: 1.35;
+  line-height: 1.3;
 }
 
 .setup-error {
   min-height: 16px;
-  margin: 4px 0;
+  margin: 3px 0;
   color: var(--danger);
   font-size: 12px;
   font-weight: 550;
@@ -831,7 +915,7 @@ main.is-stale {
 
 .setup-submit {
   width: 100%;
-  height: 38px;
+  height: 36px;
   color: #10231d;
   background: linear-gradient(135deg, var(--accent-cool), var(--accent-warm));
   border: 1px solid rgba(255, 255, 255, 0.38);
@@ -855,7 +939,7 @@ main.is-stale {
   align-items: center;
   justify-content: center;
   gap: 13px;
-  margin-top: 5px;
+  margin-top: 4px;
 }
 
 .text-btn {
@@ -868,9 +952,20 @@ main.is-stale {
   font-weight: 650;
 }
 
-:is(button, input):focus-visible {
+:is(button, input, [role="radio"]):focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
+}
+
+.sr-only {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
 }
 
 .hidden {
@@ -923,6 +1018,8 @@ main.is-stale {
   .meta-panel,
   .icon-btn,
   .glass-text-btn,
+  .provider-picker,
+  .provider-option,
   .setup-input,
   .input-action {
     border: 1px solid CanvasText;
