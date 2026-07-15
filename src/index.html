@@ -9,6 +9,11 @@
   </head>
   <body>
     <div id="widget" data-tauri-drag-region>
+      <div class="liquid-glass" aria-hidden="true">
+        <span class="liquid-caustic"></span>
+        <span class="liquid-rim"></span>
+      </div>
+
       <header id="widget-header" data-tauri-drag-region>
         <div class="title" data-tauri-drag-region>
           <span class="app-icon" data-tauri-drag-region aria-hidden="true">
@@ -111,7 +116,7 @@
           <h1 class="setup-title" id="setup-title">连接 MiniMax</h1>
           <p class="setup-description" id="setup-description">输入你的 MiniMax API Key，以读取 Coding Plan 用量。</p>
 
-          <label class="setup-label" for="setup-key-input">MiniMax API Key</label>
+          <label class="setup-label" id="setup-key-label" for="setup-key-input">MiniMax API Key</label>
           <div class="setup-input-row">
             <input
               id="setup-key-input"

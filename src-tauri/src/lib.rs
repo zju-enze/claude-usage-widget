@@ -1,12 +1,14 @@
+mod providers;
+
+use providers::{
+    build_http_client, is_valid_api_key, provider_from_base_url, provider_from_model,
+    request_usage, Provider,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::time::Duration;
 use tauri::Manager;
 use zeroize::{Zeroize, Zeroizing};
-
-const API_URL: &str = "https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains";
-const HELP_URL: &str = "https://platform.minimaxi.com/user-center/basic-information/interface-key";
-const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 
 #[derive(Serialize)]
 struct UsageSnapshot {
@@ -15,6 +17,7 @@ struct UsageSnapshot {
     raw: serde_json::Value,
     fetched_at: String,
     key_source: String,
+    provider: String,
 }
 
 #[derive(Serialize)]
@@ -22,6 +25,8 @@ struct ProbeState {
     has_key: bool,
     has_saved_key: bool,
     source: String,
+    provider: String,
+    provider_name: String,
 }
 
 #[derive(Serialize)]
@@ -43,161 +48,149 @@ struct ApiKey {
     source: &'static str,
 }
 
-#[derive(Debug)]
-enum ServiceError {
-    Network,
-    Unauthorized,
-    RateLimited,
-    Unavailable,
-    RequestFailed,
-    ResponseTooLarge,
-    InvalidResponse,
-}
-
-impl ServiceError {
-    fn code(&self) -> &'static str {
-        match self {
-            Self::Network => "network",
-            Self::Unauthorized => "unauthorized",
-            Self::RateLimited => "rate_limited",
-            Self::Unavailable => "service_unavailable",
-            Self::RequestFailed => "request_failed",
-            Self::ResponseTooLarge => "response_too_large",
-            Self::InvalidResponse => "invalid_response",
-        }
-    }
-}
-
-fn service_error_for_status(status: reqwest::StatusCode) -> ServiceError {
-    match status {
-        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
-            ServiceError::Unauthorized
-        }
-        reqwest::StatusCode::TOO_MANY_REQUESTS => ServiceError::RateLimited,
-        status if status.is_server_error() => ServiceError::Unavailable,
-        _ => ServiceError::RequestFailed,
-    }
-}
-
-fn build_http_client() -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(12))
-        .user_agent(concat!("claude-usage-widget/", env!("CARGO_PKG_VERSION")))
-        .build()
-}
-
-async fn request_usage(
-    client: &reqwest::Client,
-    key: &str,
-) -> Result<serde_json::Value, ServiceError> {
-    let mut response = client
-        .get(API_URL)
-        .bearer_auth(key)
-        .header(reqwest::header::REFERER, "https://platform.minimaxi.com/")
-        .header(reqwest::header::ACCEPT, "application/json")
-        .send()
-        .await
-        .map_err(|_| ServiceError::Network)?;
-
-    let status = response.status();
-    if !status.is_success() {
-        eprintln!("[minimax] request failed with HTTP {status}");
-        return Err(service_error_for_status(status));
-    }
-
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
-    {
-        return Err(ServiceError::ResponseTooLarge);
-    }
-
-    let initial_capacity = response
-        .content_length()
-        .unwrap_or(0)
-        .min(MAX_RESPONSE_BYTES as u64) as usize;
-    let mut body = Vec::with_capacity(initial_capacity);
-    while let Some(chunk) = response.chunk().await.map_err(|_| ServiceError::Network)? {
-        let next_len = body
-            .len()
-            .checked_add(chunk.len())
-            .ok_or(ServiceError::ResponseTooLarge)?;
-        if next_len > MAX_RESPONSE_BYTES {
-            return Err(ServiceError::ResponseTooLarge);
-        }
-        body.extend_from_slice(&chunk);
-    }
-
-    let value = serde_json::from_slice::<serde_json::Value>(&body)
-        .map_err(|_| ServiceError::InvalidResponse)?;
-    if value
-        .get("model_remains")
-        .and_then(|item| item.as_array())
-        .is_none()
-    {
-        return Err(ServiceError::InvalidResponse);
-    }
-    Ok(value)
-}
-
-fn is_valid_api_key(value: &str) -> bool {
-    let length = value.len();
-    (20..=512).contains(&length)
-        && value.starts_with("sk-cp-")
-        && value.is_ascii()
-        && !value
-            .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
-}
-
-fn normalize_api_key(value: String) -> Option<Zeroizing<String>> {
-    let value = Zeroizing::new(value);
+fn normalize_api_key(provider: Provider, value: &str) -> Option<Zeroizing<String>> {
     let trimmed = value.trim();
-    is_valid_api_key(trimmed).then(|| Zeroizing::new(trimmed.to_string()))
+    is_valid_api_key(provider, trimmed).then(|| Zeroizing::new(trimmed.to_string()))
 }
 
-fn environment_api_key() -> Option<ApiKey> {
-    for env_name in ["MINIMAX_API_KEY", "MINIMAX_CP_TOKEN"] {
-        if let Ok(value) = std::env::var(env_name) {
-            if let Some(value) = normalize_api_key(value) {
-                return Some(ApiKey {
-                    value,
-                    source: "env",
-                });
-            }
-        }
+fn user_home() -> Option<std::path::PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())
+        .map(std::path::PathBuf::from)
+}
 
-        #[cfg(target_os = "windows")]
+fn claude_settings_env_value(name: &str) -> Option<String> {
+    let home = user_home()?;
+    for filename in ["settings.local.json", "settings.json"] {
+        let Ok(contents) = fs::read_to_string(home.join(".claude").join(filename)) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            continue;
+        };
+        if let Some(found) = value
+            .get("env")
+            .and_then(|env| env.get(name))
+            .and_then(serde_json::Value::as_str)
         {
-            use winreg::enums::HKEY_CURRENT_USER;
-            use winreg::RegKey;
-
-            if let Ok(environment) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(r"Environment") {
-                if let Ok(value) = environment.get_value::<String, _>(env_name) {
-                    if let Some(value) = normalize_api_key(value) {
-                        return Some(ApiKey {
-                            value,
-                            source: "env",
-                        });
-                    }
-                }
+            if !found.trim().is_empty() {
+                return Some(found.to_string());
             }
         }
     }
     None
 }
 
-fn get_api_key() -> Option<ApiKey> {
-    if let Some(key) = environment_api_key() {
+fn configuration_value(name: &str) -> Option<String> {
+    if let Ok(value) = std::env::var(name) {
+        if !value.trim().is_empty() {
+            return Some(value);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use winreg::enums::HKEY_CURRENT_USER;
+        use winreg::RegKey;
+
+        if let Ok(environment) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(r"Environment") {
+            if let Ok(value) = environment.get_value::<String, _>(name) {
+                if !value.trim().is_empty() {
+                    return Some(value);
+                }
+            }
+        }
+    }
+
+    claude_settings_env_value(name)
+}
+
+fn configuration_secret(name: &str) -> Option<Zeroizing<String>> {
+    configuration_value(name).map(Zeroizing::new)
+}
+
+fn configured_base_url() -> Option<String> {
+    configuration_value("ANTHROPIC_BASE_URL")
+}
+
+fn active_provider() -> Provider {
+    if let Some(provider) = configured_base_url()
+        .as_deref()
+        .and_then(provider_from_base_url)
+    {
+        return provider;
+    }
+
+    for name in [
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "MINIMAX_MODEL",
+        "DEEPSEEK_MODEL",
+        "ZAI_MODEL",
+        "ZHIPUAI_MODEL",
+    ] {
+        if let Some(provider) = configuration_value(name)
+            .as_deref()
+            .and_then(provider_from_model)
+        {
+            return provider;
+        }
+    }
+
+    // Keep MiniMax first for backward compatibility if several unrelated provider keys coexist.
+    for provider in [Provider::Minimax, Provider::Deepseek, Provider::Zhipu] {
+        if provider.direct_env_names().iter().any(|name| {
+            configuration_secret(name)
+                .as_deref()
+                .is_some_and(|value| is_valid_api_key(provider, value))
+        }) {
+            return provider;
+        }
+    }
+
+    Provider::Minimax
+}
+
+fn environment_api_key(provider: Provider) -> Option<ApiKey> {
+    for name in provider.direct_env_names() {
+        if let Some(value) =
+            configuration_secret(name).and_then(|value| normalize_api_key(provider, value.as_str()))
+        {
+            return Some(ApiKey {
+                value,
+                source: "env",
+            });
+        }
+    }
+
+    let matches_anthropic_base = configured_base_url()
+        .as_deref()
+        .and_then(provider_from_base_url)
+        == Some(provider);
+    if matches_anthropic_base {
+        for name in ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"] {
+            if let Some(value) = configuration_secret(name)
+                .and_then(|value| normalize_api_key(provider, value.as_str()))
+            {
+                return Some(ApiKey {
+                    value,
+                    source: "env",
+                });
+            }
+        }
+    }
+    None
+}
+
+fn get_api_key(provider: Provider) -> Option<ApiKey> {
+    if let Some(key) = environment_api_key(provider) {
         return Some(key);
     }
 
-    if let Ok(bytes) = keystore::load() {
+    if let Ok(bytes) = keystore::load(provider.key_filename()) {
         if let Ok(value) = std::str::from_utf8(bytes.as_slice()) {
-            if let Some(value) = normalize_api_key(value.to_string()) {
+            if let Some(value) = normalize_api_key(provider, value) {
                 return Some(ApiKey {
                     value,
                     source: "saved",
@@ -216,13 +209,13 @@ mod keystore {
     use tempfile::NamedTempFile;
     use zeroize::Zeroizing;
 
-    pub fn key_path() -> PathBuf {
+    pub fn key_path(filename: &str) -> PathBuf {
         let base = std::env::var("APPDATA")
             .or_else(|_| std::env::var("HOME"))
             .unwrap_or_else(|_| ".".to_string());
         PathBuf::from(base)
             .join("claude-usage-widget")
-            .join("key.bin")
+            .join(filename)
     }
 
     pub(crate) fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), String> {
@@ -246,13 +239,13 @@ mod keystore {
         Ok(())
     }
 
-    pub fn save(plaintext: &[u8]) -> Result<(), String> {
+    pub fn save(filename: &str, plaintext: &[u8]) -> Result<(), String> {
         let encrypted = super::windows_crypto::encrypt(plaintext)?;
-        write_atomically(&key_path(), &encrypted)
+        write_atomically(&key_path(filename), &encrypted)
     }
 
-    pub fn load() -> Result<Zeroizing<Vec<u8>>, String> {
-        let bytes = fs::read(key_path()).map_err(|error| format!("read key: {error}"))?;
+    pub fn load(filename: &str) -> Result<Zeroizing<Vec<u8>>, String> {
+        let bytes = fs::read(key_path(filename)).map_err(|error| format!("read key: {error}"))?;
         if !bytes.starts_with(&super::windows_crypto::CRYPTPROTECT_DATA_HEADER) {
             return Err("invalid DPAPI key blob".to_string());
         }
@@ -265,14 +258,14 @@ mod keystore {
     use std::path::PathBuf;
     use zeroize::Zeroizing;
 
-    pub fn key_path() -> PathBuf {
+    pub fn key_path(filename: &str) -> PathBuf {
         let base = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         PathBuf::from(base)
             .join(".claude-usage-widget")
-            .join("key.txt")
+            .join(filename)
     }
 
-    pub fn load() -> Result<Zeroizing<Vec<u8>>, String> {
+    pub fn load(_filename: &str) -> Result<Zeroizing<Vec<u8>>, String> {
         Err("secure persistence is only available on Windows".to_string())
     }
 }
@@ -381,61 +374,73 @@ mod windows_crypto {
 }
 
 #[tauri::command]
-async fn fetch_minimax_usage(client: tauri::State<'_, ApiClient>) -> Result<UsageSnapshot, String> {
+async fn fetch_usage(client: tauri::State<'_, ApiClient>) -> Result<UsageSnapshot, String> {
+    let provider = active_provider();
     let fetched_at = chrono::Utc::now().to_rfc3339();
-    let Some(key) = get_api_key() else {
+    let Some(key) = get_api_key(provider) else {
         return Ok(UsageSnapshot {
             found: false,
             error: Some("missing_key".to_string()),
             raw: serde_json::json!({}),
             fetched_at,
             key_source: "missing".to_string(),
+            provider: provider.id().to_string(),
         });
     };
 
     let key_source = key.source.to_string();
-    Ok(match request_usage(&client.0, key.value.as_str()).await {
-        Ok(raw) => UsageSnapshot {
-            found: true,
-            error: None,
-            raw,
-            fetched_at,
-            key_source,
+    let base_url = configured_base_url();
+    Ok(
+        match request_usage(&client.0, provider, key.value.as_str(), base_url.as_deref()).await {
+            Ok(raw) => UsageSnapshot {
+                found: true,
+                error: None,
+                raw,
+                fetched_at,
+                key_source,
+                provider: provider.id().to_string(),
+            },
+            Err(error) => UsageSnapshot {
+                found: false,
+                error: Some(error.code().to_string()),
+                raw: serde_json::json!({}),
+                fetched_at,
+                key_source,
+                provider: provider.id().to_string(),
+            },
         },
-        Err(error) => UsageSnapshot {
-            found: false,
-            error: Some(error.code().to_string()),
-            raw: serde_json::json!({}),
-            fetched_at,
-            key_source,
-        },
-    })
+    )
 }
 
 #[tauri::command]
 fn probe_state() -> ProbeState {
-    let has_saved_key = saved_key_exists();
-    match get_api_key() {
+    let provider = active_provider();
+    let has_saved_key = saved_key_exists(provider);
+    match get_api_key(provider) {
         Some(key) => ProbeState {
             has_key: true,
             has_saved_key,
             source: key.source.to_string(),
+            provider: provider.id().to_string(),
+            provider_name: provider.display_name().to_string(),
         },
         None => ProbeState {
             has_key: false,
             has_saved_key,
             source: "missing".to_string(),
+            provider: provider.id().to_string(),
+            provider_name: provider.display_name().to_string(),
         },
     }
 }
 
 #[cfg(target_os = "windows")]
-fn saved_key_exists() -> bool {
-    keystore::key_path().is_file()
+fn saved_key_exists(provider: Provider) -> bool {
+    keystore::key_path(provider.key_filename()).is_file()
 }
 
 #[cfg(not(target_os = "windows"))]
-fn saved_key_exists() -> bool {
+fn saved_key_exists(_provider: Provider) -> bool {
     false
 }
 
@@ -444,17 +449,21 @@ async fn save_key_and_test(
     client: tauri::State<'_, ApiClient>,
     key: String,
 ) -> Result<SaveResult, String> {
+    let provider = active_provider();
     let mut key = Zeroizing::new(key);
     let candidate = Zeroizing::new(key.trim().to_string());
     key.zeroize();
-    if !is_valid_api_key(candidate.as_str()) {
+    if !is_valid_api_key(provider, candidate.as_str()) {
         return Ok(SaveResult {
             ok: false,
             error: Some("invalid_key_format".to_string()),
         });
     }
 
-    if let Err(error) = request_usage(&client.0, candidate.as_str()).await {
+    let base_url = configured_base_url();
+    if let Err(error) =
+        request_usage(&client.0, provider, candidate.as_str(), base_url.as_deref()).await
+    {
         return Ok(SaveResult {
             ok: false,
             error: Some(error.code().to_string()),
@@ -471,7 +480,7 @@ async fn save_key_and_test(
 
     #[cfg(target_os = "windows")]
     {
-        if keystore::save(candidate.as_bytes()).is_err() {
+        if keystore::save(provider.key_filename(), candidate.as_bytes()).is_err() {
             return Ok(SaveResult {
                 ok: false,
                 error: Some("storage_error".to_string()),
@@ -487,7 +496,7 @@ async fn save_key_and_test(
 
 #[tauri::command]
 fn clear_key() -> Result<(), String> {
-    let path = keystore::key_path();
+    let path = keystore::key_path(active_provider().key_filename());
     if path.exists() {
         fs::remove_file(path).map_err(|_| "remove_failed".to_string())?;
     }
@@ -496,7 +505,7 @@ fn clear_key() -> Result<(), String> {
 
 #[tauri::command]
 fn open_help_page() -> Result<(), String> {
-    open::that_detached(HELP_URL).map_err(|_| "open_failed".to_string())
+    open::that_detached(active_provider().help_url()).map_err(|_| "open_failed".to_string())
 }
 
 #[tauri::command]
@@ -527,13 +536,26 @@ fn set_window_mode(app: tauri::AppHandle, mode: WindowMode) -> Result<(), String
     };
     window
         .set_size(tauri::LogicalSize::new(width, height))
-        .map_err(|_| "resize_failed".to_string())
+        .map_err(|_| "resize_failed".to_string())?;
+
+    #[cfg(target_os = "windows")]
+    apply_rounded_window_region(&window, width, height)?;
+
+    Ok(())
 }
 
 #[tauri::command]
 fn read_active_model() -> ActiveModelInfo {
-    for name in ["MINIMAX_MODEL", "CLAUDE_MODEL", "ANTHROPIC_MODEL"] {
-        if let Ok(value) = std::env::var(name) {
+    for name in [
+        "MINIMAX_MODEL",
+        "DEEPSEEK_MODEL",
+        "ZAI_MODEL",
+        "ZHIPUAI_MODEL",
+        "ANTHROPIC_MODEL",
+        "CLAUDE_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    ] {
+        if let Some(value) = configuration_value(name) {
             let trimmed = value.trim();
             if !trimmed.is_empty() {
                 return ActiveModelInfo {
@@ -544,14 +566,9 @@ fn read_active_model() -> ActiveModelInfo {
         }
     }
 
-    if let Some(home) = std::env::var("HOME")
-        .ok()
-        .or_else(|| std::env::var("USERPROFILE").ok())
-    {
-        for filename in ["settings.json", "settings.local.json"] {
-            let path = std::path::PathBuf::from(&home)
-                .join(".claude")
-                .join(filename);
+    if let Some(home) = user_home() {
+        for filename in ["settings.local.json", "settings.json"] {
+            let path = home.join(".claude").join(filename);
             if let Ok(contents) = fs::read_to_string(path) {
                 if let Some(model) = extract_model_from_claude_settings(&contents) {
                     return ActiveModelInfo {
@@ -591,7 +608,15 @@ fn extract_model_from_claude_settings(contents: &str) -> Option<String> {
     }
 
     if let Some(environment) = value.get("env").and_then(|item| item.as_object()) {
-        for name in ["MINIMAX_MODEL", "CLAUDE_MODEL", "ANTHROPIC_MODEL"] {
+        for name in [
+            "MINIMAX_MODEL",
+            "DEEPSEEK_MODEL",
+            "ZAI_MODEL",
+            "ZHIPUAI_MODEL",
+            "ANTHROPIC_MODEL",
+            "CLAUDE_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        ] {
             if let Some(model) = environment.get(name).and_then(|item| item.as_str()) {
                 let trimmed = model.trim();
                 if !trimmed.is_empty() {
@@ -672,12 +697,93 @@ fn system_transparency_enabled() -> bool {
         .is_ok_and(|value| value != 0)
 }
 
+#[cfg(target_os = "windows")]
+const WINDOW_RADIUS_LOGICAL: f64 = 24.0;
+
+#[cfg(target_os = "windows")]
+fn apply_rounded_window_region(
+    window: &tauri::WebviewWindow,
+    logical_width: f64,
+    logical_height: f64,
+) -> Result<(), String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, DeleteObject, SetWindowRgn};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, HWND_TOP, SWP_FRAMECHANGED,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_MAXIMIZEBOX,
+        WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+    };
+
+    let scale = window
+        .scale_factor()
+        .map_err(|_| "window_scale_unavailable".to_string())?;
+    let width = (logical_width * scale).round().max(1.0) as i32;
+    let height = (logical_height * scale).round().max(1.0) as i32;
+    let diameter = (WINDOW_RADIUS_LOGICAL * 2.0 * scale).round().max(2.0) as i32;
+    let native_hwnd = window
+        .hwnd()
+        .map_err(|_| "window_handle_unavailable".to_string())?;
+    let hwnd = HWND(native_hwnd.0);
+
+    unsafe {
+        // Tao keeps caption-related style bits on undecorated top-level windows
+        // and normally suppresses their non-client area through message handling.
+        // A custom region plus blur can make Windows briefly paint that caption
+        // when the window activates, so remove the unused frame bits explicitly.
+        let frame_bits =
+            (WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME).0 as isize;
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        if style & frame_bits != 0 {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style & !frame_bits);
+            SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+            )
+            .map_err(|_| "window_frame_failed".to_string())?;
+        }
+
+        // Native Windows backdrops paint the complete HWND. A window region is
+        // therefore required so the blur itself follows the same 24px contour
+        // as the WebView instead of leaking into four rectangular corners.
+        let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
+        if region.0.is_null() {
+            return Err("window_shape_failed".to_string());
+        }
+        if SetWindowRgn(hwnd, region, true) == 0 {
+            let _ = DeleteObject(region);
+            return Err("window_shape_failed".to_string());
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn apply_current_window_shape(window: &tauri::WebviewWindow) -> Result<(), String> {
+    let scale = window
+        .scale_factor()
+        .map_err(|_| "window_scale_unavailable".to_string())?;
+    let size = window
+        .inner_size()
+        .map_err(|_| "window_size_unavailable".to_string())?;
+    apply_rounded_window_region(
+        window,
+        size.width as f64 / scale,
+        size.height as f64 / scale,
+    )
+}
+
 #[tauri::command]
 fn window_effect_mode() -> &'static str {
     #[cfg(target_os = "windows")]
     {
         if system_transparency_enabled() {
-            "acrylic"
+            "blur"
         } else {
             "transparent"
         }
@@ -695,7 +801,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(ApiClient(client))
         .invoke_handler(tauri::generate_handler![
-            fetch_minimax_usage,
+            fetch_usage,
             probe_state,
             save_key_and_test,
             clear_key,
@@ -714,8 +820,34 @@ pub fn run() {
                 if system_transparency_enabled() {
                     use tauri::window::{Effect, EffectsBuilder};
 
-                    let _ =
-                        window.set_effects(EffectsBuilder::new().effect(Effect::Acrylic).build());
+                    let _ = window.set_effects(EffectsBuilder::new().effect(Effect::Blur).build());
+                }
+
+                #[cfg(target_os = "windows")]
+                let _ = apply_rounded_window_region(&window, 360.0, 244.0);
+
+                #[cfg(target_os = "windows")]
+                {
+                    let shape_window = window.clone();
+                    window.on_window_event(move |event| match event {
+                        tauri::WindowEvent::ScaleFactorChanged {
+                            scale_factor,
+                            new_inner_size,
+                            ..
+                        } => {
+                            let logical_width = new_inner_size.width as f64 / scale_factor;
+                            let logical_height = new_inner_size.height as f64 / scale_factor;
+                            let _ = apply_rounded_window_region(
+                                &shape_window,
+                                logical_width,
+                                logical_height,
+                            );
+                        }
+                        tauri::WindowEvent::Focused(true) => {
+                            let _ = apply_current_window_shape(&shape_window);
+                        }
+                        _ => {}
+                    });
                 }
 
                 let monitor_size = window.primary_monitor().ok().flatten().map(|monitor| {
@@ -746,6 +878,8 @@ pub fn run() {
                         if is_running != was_running {
                             if is_running {
                                 let _ = window.show();
+                                #[cfg(target_os = "windows")]
+                                let _ = apply_current_window_shape(&window);
                             } else {
                                 let _ = window.hide();
                             }
@@ -763,31 +897,6 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn validates_api_key_shape_and_bounds() {
-        assert!(is_valid_api_key("sk-cp-12345678901234"));
-        assert!(!is_valid_api_key("sk-ant-12345678901234"));
-        assert!(!is_valid_api_key("sk-cp-short"));
-        assert!(!is_valid_api_key("sk-cp-12345678901234\n"));
-        assert!(!is_valid_api_key(&format!("sk-cp-{}", "x".repeat(600))));
-    }
-
-    #[test]
-    fn maps_remote_statuses_to_stable_error_codes() {
-        assert_eq!(
-            service_error_for_status(reqwest::StatusCode::UNAUTHORIZED).code(),
-            "unauthorized"
-        );
-        assert_eq!(
-            service_error_for_status(reqwest::StatusCode::TOO_MANY_REQUESTS).code(),
-            "rate_limited"
-        );
-        assert_eq!(
-            service_error_for_status(reqwest::StatusCode::BAD_GATEWAY).code(),
-            "service_unavailable"
-        );
-    }
 
     #[test]
     fn extracts_model_from_supported_claude_settings_shapes() {

@@ -3,9 +3,9 @@
   --text-primary: rgba(255, 255, 255, 0.96);
   --text-secondary: rgba(238, 245, 255, 0.72);
   --text-muted: rgba(226, 237, 252, 0.54);
-  --glass-surface: rgba(15, 20, 29, 0.68);
-  --glass-fallback: rgba(15, 20, 29, 0.82);
-  --setup-card-surface: rgba(15, 20, 29, 0.88);
+  --glass-surface: rgba(15, 20, 29, 0.48);
+  --glass-fallback: rgba(15, 20, 29, 0.72);
+  --setup-card-surface: rgba(15, 20, 29, 0.80);
   --glass-border: rgba(255, 255, 255, 0.18);
   --glass-border-strong: rgba(255, 255, 255, 0.34);
   --glass-highlight: rgba(255, 255, 255, 0.16);
@@ -15,10 +15,10 @@
   --track-surface: rgba(255, 255, 255, 0.10);
   --panel-surface: rgba(255, 255, 255, 0.055);
   --setup-overlay: rgba(7, 10, 16, 0.56);
-  --ambient-start: rgba(43, 57, 78, 0.14);
-  --ambient-end: rgba(14, 19, 29, 0.22);
-  --ambient-cool: rgba(89, 179, 255, 0.19);
-  --ambient-warm: rgba(113, 244, 200, 0.12);
+  --ambient-start: rgba(43, 57, 78, 0.10);
+  --ambient-end: rgba(14, 19, 29, 0.16);
+  --ambient-cool: rgba(89, 179, 255, 0.14);
+  --ambient-warm: rgba(113, 244, 200, 0.09);
   --accent-cool: #75dcff;
   --accent-mid: #8ce5dc;
   --accent-warm: #83f0bd;
@@ -38,9 +38,9 @@
     --text-primary: rgba(17, 25, 38, 0.94);
     --text-secondary: rgba(24, 36, 54, 0.68);
     --text-muted: rgba(32, 48, 70, 0.52);
-    --glass-surface: rgba(241, 247, 255, 0.70);
-    --glass-fallback: rgba(240, 245, 252, 0.84);
-    --setup-card-surface: rgba(246, 250, 255, 0.90);
+    --glass-surface: rgba(241, 247, 255, 0.50);
+    --glass-fallback: rgba(240, 245, 252, 0.74);
+    --setup-card-surface: rgba(246, 250, 255, 0.82);
     --glass-border: rgba(255, 255, 255, 0.74);
     --glass-border-strong: rgba(255, 255, 255, 0.94);
     --glass-highlight: rgba(255, 255, 255, 0.68);
@@ -58,19 +58,27 @@
   }
 }
 
-:root[data-window-effect="acrylic"] {
-  --glass-surface: rgba(15, 20, 29, 0.32);
-  --glass-fallback: rgba(15, 20, 29, 0.62);
-  --ambient-start: rgba(43, 57, 78, 0.08);
-  --ambient-end: rgba(14, 19, 29, 0.14);
+:root[data-window-effect="blur"] {
+  --glass-surface: rgba(11, 16, 24, 0.14);
+  --glass-fallback: rgba(11, 16, 24, 0.22);
+  --setup-card-surface: rgba(11, 16, 24, 0.70);
+  --setup-overlay: rgba(7, 10, 16, 0.24);
+  --ambient-start: rgba(43, 57, 78, 0.04);
+  --ambient-end: rgba(14, 19, 29, 0.08);
+  --ambient-cool: rgba(89, 179, 255, 0.11);
+  --ambient-warm: rgba(113, 244, 200, 0.07);
 }
 
 @media (prefers-color-scheme: light) {
-  :root[data-window-effect="acrylic"] {
-    --glass-surface: rgba(241, 247, 255, 0.34);
-    --glass-fallback: rgba(240, 245, 252, 0.64);
-    --ambient-start: rgba(238, 245, 255, 0.08);
-    --ambient-end: rgba(207, 220, 238, 0.14);
+  :root[data-window-effect="blur"] {
+    --glass-surface: rgba(241, 247, 255, 0.16);
+    --glass-fallback: rgba(240, 245, 252, 0.24);
+    --setup-card-surface: rgba(246, 250, 255, 0.72);
+    --setup-overlay: rgba(224, 233, 245, 0.26);
+    --ambient-start: rgba(238, 245, 255, 0.04);
+    --ambient-end: rgba(207, 220, 238, 0.08);
+    --ambient-cool: rgba(64, 167, 255, 0.10);
+    --ambient-warm: rgba(53, 204, 154, 0.07);
   }
 }
 
@@ -107,13 +115,23 @@ button {
 }
 
 #widget {
+  --pointer-x: 50%;
+  --pointer-y: 18%;
+  --refract-x: 0px;
+  --refract-y: -1px;
+  --liquid-strength: 0.62;
   position: relative;
   isolation: isolate;
   width: 100%;
   height: 100%;
   overflow: hidden;
+  background: transparent;
   border-radius: var(--radius-shell);
   animation: widget-enter 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+:root[data-window-effect="blur"] #widget {
+  animation: none;
 }
 
 #widget::before,
@@ -139,9 +157,9 @@ button {
   border: 1px solid var(--glass-border);
   box-shadow:
     inset 0 1px 0 var(--glass-border-strong),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.18),
-    inset 1px 0 0 rgba(255, 255, 255, 0.08),
-    inset -1px 0 0 rgba(0, 0, 0, 0.10);
+    inset 0 -1px 0 rgba(255, 255, 255, 0.07),
+    inset 1px 0 0 rgba(255, 255, 255, 0.07),
+    inset -1px 0 0 rgba(255, 255, 255, 0.04);
 }
 
 @supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
@@ -150,6 +168,74 @@ button {
     -webkit-backdrop-filter: blur(18px) saturate(135%);
     backdrop-filter: blur(18px) saturate(135%);
   }
+
+  :root[data-window-effect="blur"] #widget::after {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+.liquid-glass {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  overflow: hidden;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.liquid-caustic,
+.liquid-rim {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.liquid-caustic {
+  inset: -2px;
+  opacity: var(--liquid-strength);
+  background:
+    radial-gradient(
+      128px 84px at calc(var(--pointer-x) + var(--refract-x)) calc(var(--pointer-y) + var(--refract-y)),
+      rgba(255, 255, 255, 0.13),
+      rgba(117, 220, 255, 0.055) 38%,
+      transparent 72%
+    );
+  -webkit-mask-image: radial-gradient(128px 84px at var(--pointer-x) var(--pointer-y), #000 0%, transparent 74%);
+  mask-image: radial-gradient(128px 84px at var(--pointer-x) var(--pointer-y), #000 0%, transparent 74%);
+  mix-blend-mode: screen;
+  transform: translate3d(var(--refract-x), var(--refract-y), 0);
+  transition: opacity 180ms ease, transform 120ms ease-out;
+  will-change: transform, opacity;
+}
+
+.liquid-rim {
+  padding: 1px;
+  background:
+    radial-gradient(
+      170px 104px at var(--pointer-x) var(--pointer-y),
+      rgba(255, 255, 255, 0.94),
+      rgba(176, 224, 255, 0.34) 38%,
+      transparent 72%
+    ),
+    linear-gradient(
+      145deg,
+      rgba(255, 255, 255, 0.38),
+      rgba(255, 255, 255, 0.08) 42%,
+      rgba(118, 224, 255, 0.16) 72%,
+      rgba(255, 255, 255, 0.28)
+    );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  opacity: 0.92;
+  filter: drop-shadow(0 0 4px rgba(150, 224, 255, 0.16));
 }
 
 @keyframes widget-enter {
@@ -166,7 +252,7 @@ button {
 header,
 main {
   position: relative;
-  z-index: 1;
+  z-index: 2;
 }
 
 header {
@@ -607,6 +693,18 @@ main.is-stale {
   flex: 1 1 auto;
 }
 
+#widget.is-collapsed {
+  --liquid-strength: 0.54;
+}
+
+#widget.is-setup-open .liquid-glass {
+  opacity: 0.32;
+}
+
+#widget.is-setup-open .liquid-caustic {
+  transform: none;
+}
+
 .setup-overlay {
   position: absolute;
   z-index: 5;
@@ -788,6 +886,10 @@ main.is-stale {
     --text-muted: rgba(255, 255, 255, 0.72);
     --control-border: rgba(255, 255, 255, 0.34);
   }
+
+  .liquid-glass {
+    display: none;
+  }
 }
 
 @media (prefers-color-scheme: light) and (prefers-contrast: more) {
@@ -803,6 +905,10 @@ main.is-stale {
 }
 
 @media (forced-colors: active) {
+  .liquid-glass {
+    display: none !important;
+  }
+
   #widget::before,
   #widget::after,
   .setup-overlay,
@@ -832,6 +938,11 @@ main.is-stale {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .liquid-caustic {
+    opacity: 0.48;
+    transform: none;
+  }
+
   *,
   *::before,
   *::after {

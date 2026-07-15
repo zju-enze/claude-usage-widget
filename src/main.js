@@ -1,22 +1,47 @@
 import {
   TIME_ZONE,
-  formatDuration,
-  formatLocalTime,
-  remainingToUsedPercent,
-  selectPrimaryUsage,
+  isPlausibleProviderKey,
+  normalizeProviderUsage,
 } from "./usage-utils.js";
 
 const nativeInvoke = globalThis.__TAURI__?.core?.invoke;
 const hasNativeBridge = typeof nativeInvoke === "function";
 const REFRESH_MS = 30_000;
 
+const PROVIDERS = {
+  minimax: {
+    name: "MiniMax",
+    labels: ["5 小时", "7 天"],
+    description: "输入你的 MiniMax API Key，以读取 Coding Plan 用量。",
+    placeholder: "sk-cp-...",
+    security: "验证和查询时只发送至 MiniMax 官方 HTTPS 接口；Windows 使用系统凭据加密后保存在本机。",
+    environment: "支持 MINIMAX_API_KEY 或 MINIMAX_CP_TOKEN；应用不会在界面中读取或显示其内容。",
+  },
+  deepseek: {
+    name: "DeepSeek",
+    labels: ["账户余额", "API 状态"],
+    description: "输入你的 DeepSeek API Key，以读取 API 账户余额与可用状态。",
+    placeholder: "sk-...",
+    security: "验证和查询时只发送至 DeepSeek 官方 HTTPS 接口；Windows 使用系统凭据加密后保存在本机。",
+    environment: "支持 DEEPSEEK_API_KEY；使用 DeepSeek Base URL 时也支持 ANTHROPIC_AUTH_TOKEN 或 ANTHROPIC_API_KEY。",
+  },
+  zhipu: {
+    name: "智谱",
+    labels: ["5 小时", "MCP 月额度"],
+    description: "输入你的智谱 API Key，以读取 GLM Coding Plan 配额。",
+    placeholder: "请输入 API Key",
+    security: "验证和查询时只发送至智谱官方 HTTPS 接口；Windows 使用系统凭据加密后保存在本机。",
+    environment: "支持 ZAI_API_KEY、ZHIPUAI_API_KEY 或 BIGMODEL_API_KEY；使用智谱 Base URL 时也支持 ANTHROPIC_AUTH_TOKEN。",
+  },
+};
+
 const ERROR_MESSAGES = {
   invalid_key_format: "Key 格式不正确，请检查后重试",
-  missing_key: "需要连接 MiniMax",
+  missing_key: "需要连接",
   unauthorized: "Key 已失效，请更新连接",
   rate_limited: "请求过于频繁，请稍后重试",
-  service_unavailable: "MiniMax 服务暂时不可用",
-  request_failed: "MiniMax 拒绝了本次请求",
+  service_unavailable: "服务暂时不可用",
+  request_failed: "服务拒绝了本次请求",
   response_too_large: "服务响应异常，请稍后重试",
   invalid_response: "收到无法识别的用量数据",
   network: "网络连接失败，点击刷新重试",
@@ -38,9 +63,12 @@ let pollingTimer = null;
 let keySource = "missing";
 let hasSavedKey = false;
 let setupMode = "initial";
+let currentProvider = "minimax";
 let collapsed = false;
 let clearConfirmTimer = null;
 let setupReturnFocus = null;
+let liquidFrame = null;
+let liquidPoint = null;
 
 function invoke(command, args = {}) {
   if (!hasNativeBridge) return Promise.reject(new Error("native_unavailable"));
@@ -48,7 +76,14 @@ function invoke(command, args = {}) {
 }
 
 function friendlyError(code) {
+  if (code === "missing_key") return `需要连接 ${PROVIDERS[currentProvider].name}`;
   return ERROR_MESSAGES[code] ?? "操作未完成，请重试";
+}
+
+function applyProvider(provider) {
+  if (!PROVIDERS[provider] || provider === currentProvider) return;
+  currentProvider = provider;
+  if ($("five-hour-label")) clearUsage("等待首次同步");
 }
 
 function errorCode(error) {
@@ -138,20 +173,38 @@ function setConnectionState(state, message) {
   updateRefreshTooltip();
 }
 
-function paintBar(fillId, valueId, trackId, descriptionId, usedPercent, resetMs, prefix) {
-  const fill = $(fillId);
-  const value = $(valueId);
-  const track = $(trackId);
-  const description = $(descriptionId);
+function paintMetric(slot, metric = {}) {
+  const ids = slot === 0
+    ? {
+        label: "five-hour-label",
+        fill: "fiveHour-fill",
+        value: "fiveHour-pct",
+        track: "fiveHour-track",
+        description: "fiveHour-resets",
+      }
+    : {
+        label: "seven-day-label",
+        fill: "sevenDay-fill",
+        value: "sevenDay-pct",
+        track: "sevenDay-track",
+        description: "sevenDay-resets",
+      };
+  const label = $(ids.label);
+  const fill = $(ids.fill);
+  const value = $(ids.value);
+  const track = $(ids.track);
+  const description = $(ids.description);
+  const usedPercent = Number(metric.percent);
 
-  if (!Number.isFinite(usedPercent)) {
+  label.textContent = metric.label || PROVIDERS[currentProvider].labels[slot];
+  if (metric.percent == null || !Number.isFinite(usedPercent)) {
     fill.style.width = "0%";
     fill.className = "bar-fill is-empty";
     fill.dataset.value = "";
-    value.textContent = "暂无数据";
-    description.textContent = prefix || "等待首次同步";
+    value.textContent = metric.value || "暂无数据";
+    description.textContent = metric.description || "等待首次同步";
     track.removeAttribute("aria-valuenow");
-    track.setAttribute("aria-valuetext", "暂无数据");
+    track.setAttribute("aria-valuetext", metric.ariaText || value.textContent);
     return;
   }
 
@@ -160,13 +213,12 @@ function paintBar(fillId, valueId, trackId, descriptionId, usedPercent, resetMs,
   const previous = fill.dataset.value;
   fill.style.width = `${normalized}%`;
   fill.dataset.value = String(normalized);
-  fill.className = `bar-fill ${normalized >= 90 ? "is-bad" : normalized >= 70 ? "is-warning" : "is-good"}`;
-  value.textContent = `已用 ${rounded}%`;
+  const tone = metric.tone || (normalized >= 90 ? "bad" : normalized >= 70 ? "warning" : "good");
+  fill.className = `bar-fill is-${tone}`;
+  value.textContent = metric.value || `已用 ${rounded}%`;
   track.setAttribute("aria-valuenow", String(rounded));
-  track.setAttribute("aria-valuetext", `已使用 ${rounded}%`);
-
-  const reset = formatDuration(resetMs);
-  description.textContent = reset === "—" ? prefix : `${prefix} · ${reset} 后重置`;
+  track.setAttribute("aria-valuetext", metric.ariaText || `已使用 ${rounded}%`);
+  description.textContent = metric.description || "已同步";
 
   if (previous && previous !== String(normalized)) {
     fill.classList.remove("is-shine");
@@ -175,8 +227,9 @@ function paintBar(fillId, valueId, trackId, descriptionId, usedPercent, resetMs,
 }
 
 function clearUsage(message = "连接后显示") {
-  paintBar("fiveHour-fill", "fiveHour-pct", "fiveHour-track", "fiveHour-resets", null, 0, message);
-  paintBar("sevenDay-fill", "sevenDay-pct", "sevenDay-track", "sevenDay-resets", null, 0, message);
+  const labels = PROVIDERS[currentProvider].labels;
+  paintMetric(0, { label: labels[0], description: message });
+  paintMetric(1, { label: labels[1], description: message });
 }
 
 async function loadActiveModel() {
@@ -212,7 +265,7 @@ async function loadWindowEffectMode() {
   if (hasNativeBridge) {
     try {
       const nativeMode = await invoke("window_effect_mode");
-      if (nativeMode === "acrylic" || nativeMode === "transparent") {
+      if (nativeMode === "blur" || nativeMode === "transparent") {
         mode = nativeMode;
       }
     } catch {
@@ -220,6 +273,55 @@ async function loadWindowEffectMode() {
     }
   }
   document.documentElement.dataset.windowEffect = mode;
+}
+
+function resetLiquidGlass() {
+  liquidPoint = null;
+  if (liquidFrame !== null) {
+    cancelAnimationFrame(liquidFrame);
+    liquidFrame = null;
+  }
+  const widget = $("widget");
+  widget.style.setProperty("--pointer-x", "50%");
+  widget.style.setProperty("--pointer-y", "18%");
+  widget.style.setProperty("--refract-x", "0px");
+  widget.style.setProperty("--refract-y", "-1px");
+  widget.style.setProperty("--liquid-strength", "0.62");
+}
+
+function renderLiquidGlass() {
+  liquidFrame = null;
+  const widget = $("widget");
+  if (!liquidPoint || document.hidden || widget.classList.contains("is-setup-open")) return;
+
+  const rect = widget.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return;
+  const x = Math.min(1, Math.max(0, (liquidPoint.x - rect.left) / rect.width));
+  const y = Math.min(1, Math.max(0, (liquidPoint.y - rect.top) / rect.height));
+  const motionScale = collapsed ? 0.5 : 1;
+  const refractX = (x - 0.5) * 6 * motionScale;
+  const refractY = (y - 0.5) * 4 * motionScale;
+
+  widget.style.setProperty("--pointer-x", `${(x * 100).toFixed(2)}%`);
+  widget.style.setProperty("--pointer-y", `${(y * 100).toFixed(2)}%`);
+  widget.style.setProperty("--refract-x", `${refractX.toFixed(2)}px`);
+  widget.style.setProperty("--refract-y", `${refractY.toFixed(2)}px`);
+  widget.style.setProperty("--liquid-strength", collapsed ? "0.72" : "0.92");
+}
+
+function setupLiquidGlass() {
+  const canTrackPointer = window.matchMedia("(hover: hover) and (pointer: fine)").matches;
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const highContrast = window.matchMedia("(prefers-contrast: more)").matches;
+  if (!canTrackPointer || reduceMotion || highContrast) return;
+
+  const widget = $("widget");
+  widget.addEventListener("pointermove", (event) => {
+    if (widget.classList.contains("is-setup-open")) return;
+    liquidPoint = { x: event.clientX, y: event.clientY };
+    if (liquidFrame === null) liquidFrame = requestAnimationFrame(renderLiquidGlass);
+  }, { passive: true });
+  widget.addEventListener("pointerleave", resetLiquidGlass, { passive: true });
 }
 
 async function refresh() {
@@ -236,37 +338,15 @@ async function refresh() {
   let shouldOpenSetup = false;
 
   try {
-    const snapshot = await invoke("fetch_minimax_usage");
+    const snapshot = await invoke("fetch_usage");
+    applyProvider(snapshot?.provider);
     if (!snapshot?.found) throw usageError(snapshot?.error || "invalid_response");
 
     keySource = snapshot.key_source || keySource;
-    const primary = selectPrimaryUsage(snapshot.raw?.model_remains);
-    if (!primary) throw usageError("no_usage");
-
-    const intervalStart = formatLocalTime(primary.start_time);
-    const intervalEnd = formatLocalTime(primary.end_time);
-    const intervalLabel = intervalStart === "—" || intervalEnd === "—"
-      ? "本周期"
-      : `${intervalStart}–${intervalEnd}`;
-
-    paintBar(
-      "fiveHour-fill",
-      "fiveHour-pct",
-      "fiveHour-track",
-      "fiveHour-resets",
-      remainingToUsedPercent(primary.current_interval_remaining_percent),
-      Number(primary.remains_time),
-      intervalLabel,
-    );
-    paintBar(
-      "sevenDay-fill",
-      "sevenDay-pct",
-      "sevenDay-track",
-      "sevenDay-resets",
-      remainingToUsedPercent(primary.current_weekly_remaining_percent),
-      Number(primary.weekly_remains_time),
-      "本周",
-    );
+    const usage = normalizeProviderUsage(currentProvider, snapshot.raw);
+    if (!usage?.metrics?.length) throw usageError("no_usage");
+    paintMetric(0, usage.metrics[0]);
+    paintMetric(1, usage.metrics[1]);
 
     const fetchedAt = new Date(snapshot.fetched_at);
     lastUpdatedAt = Number.isNaN(fetchedAt.getTime()) ? new Date() : fetchedAt;
@@ -332,6 +412,8 @@ async function showSetup(show, mode = "manage", source = keySource) {
   const submit = $("setup-submit");
   const clear = $("setup-clear");
   const cancel = $("setup-cancel");
+  $("widget").classList.toggle("is-setup-open", show);
+  if (show) resetLiquidGlass();
 
   if (!show) {
     overlay.classList.add("hidden");
@@ -356,23 +438,26 @@ async function showSetup(show, mode = "manage", source = keySource) {
   }
   setupMode = mode;
   keySource = source;
+  const profile = PROVIDERS[currentProvider];
   $("setup-error").textContent = "";
   input.setAttribute("aria-invalid", "false");
   input.value = "";
   input.type = "password";
+  input.placeholder = profile.placeholder;
+  $("setup-key-label").textContent = `${profile.name} API Key`;
   toggle.textContent = "显示";
   toggle.setAttribute("aria-label", "显示 API Key");
 
   const usesEnvironment = source === "env";
   $("setup-title").textContent = usesEnvironment
-    ? "环境变量已连接"
-    : mode === "initial" ? "连接 MiniMax" : "更新连接";
+    ? `${profile.name} 环境变量已连接`
+    : mode === "initial" ? `连接 ${profile.name}` : `更新 ${profile.name} 连接`;
   $("setup-description").textContent = usesEnvironment
     ? "当前 Key 由系统环境变量提供。为避免来源冲突，请在环境变量中修改或移除。"
-    : "输入你的 MiniMax API Key，以读取 Coding Plan 用量。";
+    : profile.description;
   $("setup-security").textContent = usesEnvironment
-    ? "支持 MINIMAX_API_KEY 或 MINIMAX_CP_TOKEN；应用不会在界面中读取或显示其内容。"
-    : "验证和查询时只发送至 MiniMax 官方 HTTPS 接口；Windows 使用系统凭据加密后保存在本机。";
+    ? profile.environment
+    : profile.security;
 
   input.disabled = usesEnvironment;
   toggle.disabled = usesEnvironment;
@@ -404,7 +489,7 @@ async function submitSetup(event) {
 
   errorElement.textContent = "";
   input.setAttribute("aria-invalid", "false");
-  if (!candidate.startsWith("sk-cp-") || candidate.length < 20 || candidate.length > 512) {
+  if (!isPlausibleProviderKey(currentProvider, candidate)) {
     errorElement.textContent = friendlyError("invalid_key_format");
     input.setAttribute("aria-invalid", "true");
     input.focus();
@@ -436,6 +521,7 @@ async function manageKey() {
   let source = keySource;
   try {
     const state = await invoke("probe_state");
+    applyProvider(state?.provider);
     source = state?.source || source;
     hasSavedKey = Boolean(state?.has_saved_key);
   } catch {
@@ -500,10 +586,12 @@ async function toggleCollapsed() {
   button.title = collapsed ? "展开小组件" : "收起小组件";
   button.setAttribute("aria-label", button.title);
   button.setAttribute("aria-expanded", String(!collapsed));
+  resetLiquidGlass();
   await setWindowMode(collapsed ? "collapsed" : "expanded");
 }
 
 function setupInteractions() {
+  setupLiquidGlass();
   $("btn-refresh").addEventListener("click", refresh);
   $("btn-collapse").addEventListener("click", toggleCollapsed);
   $("btn-close").addEventListener("click", hideWidget);
@@ -545,7 +633,10 @@ function setupInteractions() {
   });
 
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) stopPolling();
+    if (document.hidden) {
+      resetLiquidGlass();
+      stopPolling();
+    }
     else if (keySource !== "missing") {
       refresh();
       startPolling();
@@ -568,6 +659,7 @@ async function init() {
 
   try {
     const state = await invoke("probe_state");
+    applyProvider(state?.provider);
     keySource = state?.source || "missing";
     hasSavedKey = Boolean(state?.has_saved_key);
     if (!state?.has_key) {
