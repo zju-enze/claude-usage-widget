@@ -4,7 +4,10 @@
   "version": "0.1.2",
   "type": "module",
   "scripts": {
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "check": "node --check src/main.js && node --check src/usage-utils.js",
+    "test": "node --test tests/*.test.js",
+    "check:rust": "cargo check --manifest-path src-tauri/Cargo.toml --locked --all-targets"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

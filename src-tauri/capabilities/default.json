@@ -4,8 +4,6 @@
   "description": "Capability for the main floating window",
   "windows": ["main"],
   "permissions": [
-    "core:default",
-    "core:window:allow-start-dragging",
-    "opener:default"
+    "core:window:allow-start-dragging"
   ]
 }

@@ -14,8 +14,10 @@ dist-ssr
 
 # Rust / Tauri
 src-tauri/target
-src-tauri/Cargo.lock
 src-tauri/gen
+
+# Local code intelligence index
+.codegraph/
 
 # Editor directories and files
 .vscode/*

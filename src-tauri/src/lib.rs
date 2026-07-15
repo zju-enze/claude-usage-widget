@@ -1,6 +1,12 @@
+use serde::{Deserialize, Serialize};
 use std::fs;
-use serde::Serialize;
+use std::time::Duration;
 use tauri::Manager;
+use zeroize::{Zeroize, Zeroizing};
+
+const API_URL: &str = "https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains";
+const HELP_URL: &str = "https://platform.minimaxi.com/user-center/basic-information/interface-key";
+const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 
 #[derive(Serialize)]
 struct UsageSnapshot {
@@ -14,8 +20,8 @@ struct UsageSnapshot {
 #[derive(Serialize)]
 struct ProbeState {
     has_key: bool,
-    source: String,    // "saved" | "env" | "missing"
-    path: String,
+    has_saved_key: bool,
+    source: String,
 }
 
 #[derive(Serialize)]
@@ -24,15 +30,191 @@ struct SaveResult {
     error: Option<String>,
 }
 
-// ─── 持久化 key 存储（AES-256-GCM 加密） ──────────────────
-// 用 Windows DPAPI 加密（仅 Windows 平台，且只在当前用户下能解密）；
-// 这样 key 不是明文落地，进程外的攻击者拿到文件也没法直接用。
-// Linux/macOS fallback：直接写明文（开发机）；未来再换 keyring。
+#[derive(Serialize)]
+struct ActiveModelInfo {
+    model: Option<String>,
+    source: String,
+}
+
+struct ApiClient(reqwest::Client);
+
+struct ApiKey {
+    value: Zeroizing<String>,
+    source: &'static str,
+}
+
+#[derive(Debug)]
+enum ServiceError {
+    Network,
+    Unauthorized,
+    RateLimited,
+    Unavailable,
+    RequestFailed,
+    ResponseTooLarge,
+    InvalidResponse,
+}
+
+impl ServiceError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::Unauthorized => "unauthorized",
+            Self::RateLimited => "rate_limited",
+            Self::Unavailable => "service_unavailable",
+            Self::RequestFailed => "request_failed",
+            Self::ResponseTooLarge => "response_too_large",
+            Self::InvalidResponse => "invalid_response",
+        }
+    }
+}
+
+fn service_error_for_status(status: reqwest::StatusCode) -> ServiceError {
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+            ServiceError::Unauthorized
+        }
+        reqwest::StatusCode::TOO_MANY_REQUESTS => ServiceError::RateLimited,
+        status if status.is_server_error() => ServiceError::Unavailable,
+        _ => ServiceError::RequestFailed,
+    }
+}
+
+fn build_http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(12))
+        .user_agent(concat!("claude-usage-widget/", env!("CARGO_PKG_VERSION")))
+        .build()
+}
+
+async fn request_usage(
+    client: &reqwest::Client,
+    key: &str,
+) -> Result<serde_json::Value, ServiceError> {
+    let mut response = client
+        .get(API_URL)
+        .bearer_auth(key)
+        .header(reqwest::header::REFERER, "https://platform.minimaxi.com/")
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|_| ServiceError::Network)?;
+
+    let status = response.status();
+    if !status.is_success() {
+        eprintln!("[minimax] request failed with HTTP {status}");
+        return Err(service_error_for_status(status));
+    }
+
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(ServiceError::ResponseTooLarge);
+    }
+
+    let initial_capacity = response
+        .content_length()
+        .unwrap_or(0)
+        .min(MAX_RESPONSE_BYTES as u64) as usize;
+    let mut body = Vec::with_capacity(initial_capacity);
+    while let Some(chunk) = response.chunk().await.map_err(|_| ServiceError::Network)? {
+        let next_len = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or(ServiceError::ResponseTooLarge)?;
+        if next_len > MAX_RESPONSE_BYTES {
+            return Err(ServiceError::ResponseTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    let value = serde_json::from_slice::<serde_json::Value>(&body)
+        .map_err(|_| ServiceError::InvalidResponse)?;
+    if value
+        .get("model_remains")
+        .and_then(|item| item.as_array())
+        .is_none()
+    {
+        return Err(ServiceError::InvalidResponse);
+    }
+    Ok(value)
+}
+
+fn is_valid_api_key(value: &str) -> bool {
+    let length = value.len();
+    (20..=512).contains(&length)
+        && value.starts_with("sk-cp-")
+        && value.is_ascii()
+        && !value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+}
+
+fn normalize_api_key(value: String) -> Option<Zeroizing<String>> {
+    let value = Zeroizing::new(value);
+    let trimmed = value.trim();
+    is_valid_api_key(trimmed).then(|| Zeroizing::new(trimmed.to_string()))
+}
+
+fn environment_api_key() -> Option<ApiKey> {
+    for env_name in ["MINIMAX_API_KEY", "MINIMAX_CP_TOKEN"] {
+        if let Ok(value) = std::env::var(env_name) {
+            if let Some(value) = normalize_api_key(value) {
+                return Some(ApiKey {
+                    value,
+                    source: "env",
+                });
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            use winreg::enums::HKEY_CURRENT_USER;
+            use winreg::RegKey;
+
+            if let Ok(environment) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(r"Environment") {
+                if let Ok(value) = environment.get_value::<String, _>(env_name) {
+                    if let Some(value) = normalize_api_key(value) {
+                        return Some(ApiKey {
+                            value,
+                            source: "env",
+                        });
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn get_api_key() -> Option<ApiKey> {
+    if let Some(key) = environment_api_key() {
+        return Some(key);
+    }
+
+    if let Ok(bytes) = keystore::load() {
+        if let Ok(value) = std::str::from_utf8(bytes.as_slice()) {
+            if let Some(value) = normalize_api_key(value.to_string()) {
+                return Some(ApiKey {
+                    value,
+                    source: "saved",
+                });
+            }
+        }
+    }
+    None
+}
 
 #[cfg(target_os = "windows")]
 mod keystore {
     use std::fs;
-    use std::path::PathBuf;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use tempfile::NamedTempFile;
+    use zeroize::Zeroizing;
 
     pub fn key_path() -> PathBuf {
         let base = std::env::var("APPDATA")
@@ -43,654 +225,494 @@ mod keystore {
             .join("key.bin")
     }
 
-    /// 把敏感字节用 Windows DPAPI 加密后写入磁盘（仅当前用户可解）
-    pub fn save(plaintext: &[u8]) -> Result<PathBuf, String> {
-        let path = key_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
-        }
-        let mut buf = Vec::with_capacity(plaintext.len() * 2);
-        buf.extend_from_slice(&super::windows_crypto::CRYPTPROTECT_DATA_HEADER);
-        super::windows_crypto::encrypt(plaintext, &mut buf).map_err(|e| format!("dpapi encrypt: {e}"))?;
-        fs::write(&path, &buf).map_err(|e| format!("write: {e}"))?;
-        Ok(path)
-    }
+    pub(crate) fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), String> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| "invalid key path".to_string())?;
+        fs::create_dir_all(parent).map_err(|error| format!("create key directory: {error}"))?;
 
-    /// 从磁盘读取并用 DPAPI 解密
-    pub fn load() -> Result<Vec<u8>, String> {
-        let path = key_path();
-        if !path.exists() { return Err("not found".to_string()); }
-        let buf = fs::read(&path).map_err(|e| format!("read: {e}"))?;
-        if buf.len() < 4 || buf[..4] != super::windows_crypto::CRYPTPROTECT_DATA_HEADER {
-            return Err("not a dpapi blob".to_string());
-        }
-        super::windows_crypto::decrypt(&buf).map_err(|e| format!("dpapi decrypt: {e}"))
-    }
-}
-
-#[cfg(target_os = "windows")]
-mod windows_crypto {
-    pub const CRYPTPROTECT_DATA_HEADER: [u8; 4] = [b'C', b'T', b'W', b'P'];
-
-    // DPAPI flags: CRYPTPROTECT_UI_FORBIDDEN allows service access; UI = 0x1 (default).
-    // 我们用 0 让它跟当前用户绑定。
-    fn protect_flags() -> u32 {
-        0x0
-    }
-
-    pub fn encrypt(plaintext: &[u8], out: &mut Vec<u8>) -> windows::core::Result<()> {
-        use windows::Win32::Security::Cryptography::{
-            CryptProtectData, CRYPT_INTEGER_BLOB,
-        };
-        let mut in_blob = CRYPT_INTEGER_BLOB {
-            cbData: plaintext.len() as u32,
-            pbData: plaintext.as_ptr() as *mut u8,
-        };
-        let mut out_blob = CRYPT_INTEGER_BLOB {
-            cbData: 0,
-            pbData: std::ptr::null_mut(),
-        };
-        unsafe {
-            CryptProtectData(
-                &mut in_blob,
-                None,
-                None,
-                None,
-                None,
-                protect_flags(),
-                &mut out_blob,
-            )?;
-        }
-        if out_blob.cbData > 0 && !out_blob.pbData.is_null() {
-            let slice = unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize) };
-            out.clear();
-            out.extend_from_slice(&CRYPTPROTECT_DATA_HEADER);
-            out.extend_from_slice(slice);
-            // 注：DPAPI 分配的 buffer 在进程退出时由 OS 回收。
-            // 持续调用会微小泄漏，对 widget 这种低频调用没问题。
-        }
+        let mut temporary =
+            NamedTempFile::new_in(parent).map_err(|error| format!("create temp key: {error}"))?;
+        temporary
+            .write_all(contents)
+            .map_err(|error| format!("write temp key: {error}"))?;
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|error| format!("sync temp key: {error}"))?;
+        temporary
+            .persist(path)
+            .map_err(|error| format!("replace key: {}", error.error))?;
         Ok(())
     }
 
-    pub fn decrypt(blob: &[u8]) -> windows::core::Result<Vec<u8>> {
-        use windows::Win32::Security::Cryptography::{
-            CryptUnprotectData, CRYPT_INTEGER_BLOB,
-        };
-        if blob.len() < CRYPTPROTECT_DATA_HEADER.len() {
-            return Ok(Vec::new());
+    pub fn save(plaintext: &[u8]) -> Result<(), String> {
+        let encrypted = super::windows_crypto::encrypt(plaintext)?;
+        write_atomically(&key_path(), &encrypted)
+    }
+
+    pub fn load() -> Result<Zeroizing<Vec<u8>>, String> {
+        let bytes = fs::read(key_path()).map_err(|error| format!("read key: {error}"))?;
+        if !bytes.starts_with(&super::windows_crypto::CRYPTPROTECT_DATA_HEADER) {
+            return Err("invalid DPAPI key blob".to_string());
         }
-        let payload = &blob[CRYPTPROTECT_DATA_HEADER.len()..];
-        let mut in_blob = CRYPT_INTEGER_BLOB {
-            cbData: payload.len() as u32,
-            pbData: payload.as_ptr() as *mut u8,
-        };
-        let mut out_blob = CRYPT_INTEGER_BLOB {
-            cbData: 0,
-            pbData: std::ptr::null_mut(),
-        };
-        unsafe {
-            CryptUnprotectData(&mut in_blob, None, None, None, None, 0, &mut out_blob)?
-        };
-        if out_blob.cbData > 0 && !out_blob.pbData.is_null() {
-            let slice = unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize) };
-            Ok(slice.to_vec())
-        } else {
-            Ok(Vec::new())
-        }
+        super::windows_crypto::decrypt(&bytes)
     }
 }
 
 #[cfg(not(target_os = "windows"))]
 mod keystore {
-    use std::fs;
     use std::path::PathBuf;
+    use zeroize::Zeroizing;
 
     pub fn key_path() -> PathBuf {
         let base = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(base).join(".claude-usage-widget").join("key.txt")
+        PathBuf::from(base)
+            .join(".claude-usage-widget")
+            .join("key.txt")
     }
 
-    pub fn save(plaintext: &[u8]) -> Result<PathBuf, String> {
-        let path = key_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
-        }
-        fs::write(&path, plaintext).map_err(|e| format!("write: {e}"))?;
-        Ok(path)
-    }
-
-    pub fn load() -> Result<Vec<u8>, String> {
-        let path = key_path();
-        if !path.exists() { return Err("not found".to_string()); }
-        fs::read(&path).map_err(|e| format!("read: {e}"))
+    pub fn load() -> Result<Zeroizing<Vec<u8>>, String> {
+        Err("secure persistence is only available on Windows".to_string())
     }
 }
 
-fn get_api_key() -> Option<String> {
-    for env_name in &["MINIMAX_API_KEY", "MINIMAX_CP_TOKEN"] {
-        // 1) 进程级 env var（shell 启动时设的）
-        if let Ok(v) = std::env::var(env_name) {
-            let trimmed = v.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
+#[cfg(target_os = "windows")]
+mod windows_crypto {
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Cryptography::{
+        CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB,
+    };
+    use zeroize::{Zeroize, Zeroizing};
+
+    pub const CRYPTPROTECT_DATA_HEADER: [u8; 4] = [b'C', b'T', b'W', b'P'];
+    const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
+
+    pub fn encrypt(plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        let mut input = CRYPT_INTEGER_BLOB {
+            cbData: plaintext.len() as u32,
+            pbData: plaintext.as_ptr() as *mut u8,
+        };
+        let mut output = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
+
+        unsafe {
+            CryptProtectData(
+                &mut input,
+                None,
+                None,
+                None,
+                None,
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
         }
-        // 2) Windows User-level env var（setx 设置的、GUI 进程能读到）
-        #[cfg(target_os = "windows")]
-        {
-            use winreg::enums::*;
-            use winreg::RegKey;
-            if let Ok(hkcu) = RegKey::predef(HKEY_CURRENT_USER)
-                .open_subkey(r"Environment")
-            {
-                if let Ok(v) = hkcu.get_value::<String, _>(env_name) {
-                    let trimmed = v.trim();
-                    if !trimmed.is_empty() {
-                        return Some(trimmed.to_string());
-                    }
-                }
-            }
+        .map_err(|error| format!("DPAPI encrypt: {error}"))?;
+
+        if output.pbData.is_null() {
+            return Err("DPAPI returned an empty encrypted value".to_string());
         }
+        if output.cbData == 0 {
+            unsafe {
+                let _ = LocalFree(HLOCAL(output.pbData.cast()));
+            }
+            return Err("DPAPI returned an empty encrypted value".to_string());
+        }
+
+        let encrypted =
+            unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+        unsafe {
+            let _ = LocalFree(HLOCAL(output.pbData.cast()));
+        }
+
+        let mut result = Vec::with_capacity(CRYPTPROTECT_DATA_HEADER.len() + encrypted.len());
+        result.extend_from_slice(&CRYPTPROTECT_DATA_HEADER);
+        result.extend_from_slice(&encrypted);
+        Ok(result)
     }
-    // 3) 已加密存盘的
-    if let Ok(bytes) = keystore::load() {
-        if let Ok(s) = std::str::from_utf8(&bytes) {
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
+
+    pub fn decrypt(blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+        let payload = blob
+            .strip_prefix(&CRYPTPROTECT_DATA_HEADER)
+            .ok_or_else(|| "invalid DPAPI header".to_string())?;
+        let mut input = CRYPT_INTEGER_BLOB {
+            cbData: payload.len() as u32,
+            pbData: payload.as_ptr() as *mut u8,
+        };
+        let mut output = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
+
+        unsafe {
+            CryptUnprotectData(
+                &mut input,
+                None,
+                None,
+                None,
+                None,
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
         }
+        .map_err(|error| format!("DPAPI decrypt: {error}"))?;
+
+        if output.pbData.is_null() {
+            return Err("DPAPI returned an empty decrypted value".to_string());
+        }
+        if output.cbData == 0 {
+            unsafe {
+                let _ = LocalFree(HLOCAL(output.pbData.cast()));
+            }
+            return Err("DPAPI returned an empty decrypted value".to_string());
+        }
+
+        let plaintext = unsafe {
+            let slice = std::slice::from_raw_parts_mut(output.pbData, output.cbData as usize);
+            let plaintext = Zeroizing::new(slice.to_vec());
+            slice.zeroize();
+            let _ = LocalFree(HLOCAL(output.pbData.cast()));
+            plaintext
+        };
+        Ok(plaintext)
     }
-    None
 }
 
 #[tauri::command]
-async fn fetch_minimax_usage() -> UsageSnapshot {
-    eprintln!("[minimax] fetch_minimax_usage called");
+async fn fetch_minimax_usage(client: tauri::State<'_, ApiClient>) -> Result<UsageSnapshot, String> {
     let fetched_at = chrono::Utc::now().to_rfc3339();
-
-    let key = match get_api_key() {
-        Some(k) => k,
-        None => {
-            return UsageSnapshot {
-                found: false,
-                error: Some("Missing API key.".to_string()),
-                raw: serde_json::json!({}),
-                fetched_at,
-                key_source: "missing".to_string(),
-            }
-        }
-    };
-
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return UsageSnapshot {
-                found: false,
-                error: Some(format!("client build: {e}")),
-                raw: serde_json::json!({}),
-                fetched_at,
-                key_source: "missing".to_string(),
-            }
-        }
-    };
-
-    let resp = client
-        .get("https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains")
-        .header("Authorization", format!("Bearer {key}"))
-        .header("referer", "https://platform.minimaxi.com/")
-        .header("Accept", "application/json")
-        .send()
-        .await;
-
-    match resp {
-        Ok(r) => {
-            let status = r.status();
-            let text = r.text().await.unwrap_or_default();
-            if !status.is_success() {
-                return UsageSnapshot {
-                    found: false,
-                    error: Some(format!("HTTP {} — {}", status, &text[..text.len().min(200)])),
-                    raw: serde_json::json!({}),
-                    fetched_at,
-                    key_source: "saved".to_string(),
-                };
-            }
-            eprintln!("[minimax API] HTTP {} body: {}", status, &text[..text.len().min(2000)]);
-            match serde_json::from_str::<serde_json::Value>(&text) {
-                Ok(v) => UsageSnapshot {
-                    found: true,
-                    error: None,
-                    raw: v,
-                    fetched_at,
-                    key_source: "saved".to_string(),
-                },
-                Err(e) => UsageSnapshot {
-                    found: false,
-                    error: Some(format!("JSON parse: {e}")),
-                    raw: serde_json::json!({}),
-                    fetched_at,
-                    key_source: "saved".to_string(),
-                },
-            }
-        }
-        Err(e) => UsageSnapshot {
+    let Some(key) = get_api_key() else {
+        return Ok(UsageSnapshot {
             found: false,
-            error: Some(format!("network: {e}")),
+            error: Some("missing_key".to_string()),
             raw: serde_json::json!({}),
             fetched_at,
-            key_source: "saved".to_string(),
+            key_source: "missing".to_string(),
+        });
+    };
+
+    let key_source = key.source.to_string();
+    Ok(match request_usage(&client.0, key.value.as_str()).await {
+        Ok(raw) => UsageSnapshot {
+            found: true,
+            error: None,
+            raw,
+            fetched_at,
+            key_source,
         },
-    }
-}
-
-#[tauri::command]
-fn frontend_log(level: String, msg: String) {
-    eprintln!("[frontend {}] {}", level, msg);
-}
-
-/// 当前套餐暂不在 UI 展示。
-///
-/// 原因：`/v1/api/openplatform/coding_plan/remains` 端点不返回套餐名称，
-/// 公开的 minimaxi.com 开发者文档也未列出专门的套餐信息端点。
-/// 在不能从权威数据源读取的情况下，"硬编码套餐名 + 徽标" 等同于编造数据，
-/// 不符合本项目"真实数据驱动"原则。
-///
-/// 如果未来 minimaxi 提供返回套餐名的公开端点（如 `/v1/api/openplatform/coding_plan/info`），
-/// 在这里实现真正的读取逻辑后，再恢复前端套餐行。
-#[tauri::command]
-fn read_plan_metadata() -> Option<PlanMetadata> {
-    None
-}
-
-#[derive(Serialize)]
-struct PlanMetadata {
-    raw_plan_name: Option<String>,
-    display_plan_name: String,
-    plan_badge: Option<String>,
-}
-
-#[derive(Serialize)]
-struct ActiveModelInfo {
-    model: Option<String>,
-    source: String, // "env" | "config" | "none"
-}
-
-/// 读取 Claude Code 当前实际配置的模型。
-/// 优先级：
-///   1. 环境变量 `MINIMAX_MODEL` / `CLAUDE_MODEL`
-///   2. Claude Code 配置文件 `~/.claude/settings.json` 中的 model 字段
-///   3. `~/.claude/settings.local.json`
-/// 失败返回 None（前端应隐藏"当前模型"行而不是编造）。
-#[tauri::command]
-fn read_active_model() -> ActiveModelInfo {
-    // 1) env var
-    for name in &["MINIMAX_MODEL", "CLAUDE_MODEL", "ANTHROPIC_MODEL"] {
-        if let Ok(v) = std::env::var(name) {
-            let t = v.trim();
-            if !t.is_empty() {
-                return ActiveModelInfo { model: Some(t.to_string()), source: "env".to_string() };
-            }
-        }
-    }
-    // 2) Claude Code 配置 (~/.claude/settings.json / settings.local.json)
-    if let Some(home) = std::env::var("HOME").ok().or_else(|| std::env::var("USERPROFILE").ok()) {
-        for fname in &["settings.json", "settings.local.json"] {
-            let p = std::path::PathBuf::from(&home).join(".claude").join(fname);
-            if let Ok(text) = std::fs::read_to_string(&p) {
-                if let Some(m) = extract_model_from_claude_settings(&text) {
-                    return ActiveModelInfo { model: Some(m), source: "config".to_string() };
-                }
-            }
-        }
-    }
-    ActiveModelInfo { model: None, source: "none".to_string() }
-}
-
-/// 从 Claude Code settings.json 文本中提取 model 字段。
-/// 支持顶层 `model` 字段、嵌套 `env.ANTHROPIC_MODEL`、嵌套 `model.id`。
-fn extract_model_from_claude_settings(text: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(text).ok()?;
-    if let Some(s) = v.get("model").and_then(|x| x.as_str()) {
-        let t = s.trim();
-        if !t.is_empty() { return Some(t.to_string()); }
-    }
-    if let Some(id) = v.get("model").and_then(|x| x.get("id")).and_then(|x| x.as_str()) {
-        let t = id.trim();
-        if !t.is_empty() { return Some(t.to_string()); }
-    }
-    if let Some(env) = v.get("env").and_then(|x| x.as_object()) {
-        for key in &["MINIMAX_MODEL", "CLAUDE_MODEL", "ANTHROPIC_MODEL"] {
-            if let Some(s) = env.get(*key).and_then(|x| x.as_str()) {
-                let t = s.trim();
-                if !t.is_empty() { return Some(t.to_string()); }
-            }
-        }
-    }
-    None
+        Err(error) => UsageSnapshot {
+            found: false,
+            error: Some(error.code().to_string()),
+            raw: serde_json::json!({}),
+            fetched_at,
+            key_source,
+        },
+    })
 }
 
 #[tauri::command]
 fn probe_state() -> ProbeState {
-    let path = keystore::key_path();
-
-    // 1) process-level env
-    if std::env::var("MINIMAX_API_KEY").is_ok() || std::env::var("MINIMAX_CP_TOKEN").is_ok() {
-        return ProbeState { has_key: true, source: "env".to_string(), path: path.to_string_lossy().to_string() };
+    let has_saved_key = saved_key_exists();
+    match get_api_key() {
+        Some(key) => ProbeState {
+            has_key: true,
+            has_saved_key,
+            source: key.source.to_string(),
+        },
+        None => ProbeState {
+            has_key: false,
+            has_saved_key,
+            source: "missing".to_string(),
+        },
     }
-    // 2) Windows User-level env (setx)
+}
+
+#[cfg(target_os = "windows")]
+fn saved_key_exists() -> bool {
+    keystore::key_path().is_file()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn saved_key_exists() -> bool {
+    false
+}
+
+#[tauri::command]
+async fn save_key_and_test(
+    client: tauri::State<'_, ApiClient>,
+    key: String,
+) -> Result<SaveResult, String> {
+    let mut key = Zeroizing::new(key);
+    let candidate = Zeroizing::new(key.trim().to_string());
+    key.zeroize();
+    if !is_valid_api_key(candidate.as_str()) {
+        return Ok(SaveResult {
+            ok: false,
+            error: Some("invalid_key_format".to_string()),
+        });
+    }
+
+    if let Err(error) = request_usage(&client.0, candidate.as_str()).await {
+        return Ok(SaveResult {
+            ok: false,
+            error: Some(error.code().to_string()),
+        });
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Ok(SaveResult {
+            ok: false,
+            error: Some("storage_unsupported".to_string()),
+        });
+    }
+
     #[cfg(target_os = "windows")]
     {
-        use winreg::enums::*;
-        use winreg::RegKey;
-        if let Ok(hkcu) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(r"Environment") {
-            for name in &["MINIMAX_API_KEY", "MINIMAX_CP_TOKEN"] {
-                if hkcu.get_value::<String, _>(name).is_ok() {
-                    return ProbeState { has_key: true, source: "env".to_string(), path: path.to_string_lossy().to_string() };
-                }
-            }
+        if keystore::save(candidate.as_bytes()).is_err() {
+            return Ok(SaveResult {
+                ok: false,
+                error: Some("storage_error".to_string()),
+            });
         }
-    }
-    // 3) 加密存盘
-    match keystore::load() {
-        Ok(bytes) if !bytes.is_empty() => ProbeState {
-            has_key: true,
-            source: "saved".to_string(),
-            path: path.to_string_lossy().to_string(),
-        },
-        _ => ProbeState {
-            has_key: false,
-            source: "missing".to_string(),
-            path: path.to_string_lossy().to_string(),
-        },
-    }
-}
 
-#[tauri::command]
-async fn save_key_and_test(key: String) -> SaveResult {
-    let trimmed = key.trim().to_string();
-    if !trimmed.starts_with("sk-cp-") || trimmed.len() < 20 {
-        return SaveResult { ok: false, error: Some("key 应以 sk-cp- 开头".to_string()) };
+        Ok(SaveResult {
+            ok: true,
+            error: None,
+        })
     }
-
-    // 1. 加密存盘
-    if let Err(e) = keystore::save(trimmed.as_bytes()) {
-        return SaveResult { ok: false, error: Some(format!("保存失败：{e}")) };
-    }
-
-    // 2. 立刻打一次 API 验证可用
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return SaveResult { ok: false, error: Some(format!("client build: {e}")) },
-    };
-    let resp = client
-        .get("https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains")
-        .header("Authorization", format!("Bearer {trimmed}"))
-        .header("referer", "https://platform.minimaxi.com/")
-        .header("Accept", "application/json")
-        .send()
-        .await;
-
-    match resp {
-        Ok(r) if r.status().is_success() => SaveResult { ok: true, error: None },
-        Ok(r) => {
-            // 撤销保存——这个 key 是坏的
-            let _ = fs::remove_file(keystore::key_path());
-            let status = r.status();
-            let body = r.text().await.unwrap_or_default();
-            let snippet = body.chars().take(200).collect::<String>();
-            SaveResult { ok: false, error: Some(format!("API {} — {}", status, snippet)) }
-        }
-        Err(e) => {
-            let _ = fs::remove_file(keystore::key_path());
-            SaveResult { ok: false, error: Some(format!("网络：{e}")) }
-        }
-    }
-}
-
-#[tauri::command]
-async fn open_url(url: String) -> Result<(), String> {
-    let trimmed = url.trim();
-    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
-        return Err("URL 必须以 http(s):// 开头".to_string());
-    }
-    open::that_detached(trimmed).map_err(|e| format!("open: {e}"))?;
-    Ok(())
 }
 
 #[tauri::command]
 fn clear_key() -> Result<(), String> {
     let path = keystore::key_path();
     if path.exists() {
-        fs::remove_file(&path).map_err(|e| format!("remove: {e}"))?;
+        fs::remove_file(path).map_err(|_| "remove_failed".to_string())?;
     }
     Ok(())
 }
 
-/// 把当前 exe 注册到 Windows 启动项（HKCU\...\Run\ClaudeUsageWidget）。
-/// 仅 Windows。第一次启动时调用：用户如果点"开机启动"打钩，安装完就会自动注册。
 #[tauri::command]
-fn enable_autostart(app: tauri::AppHandle) -> Result<bool, String> {
-    #[cfg(target_os = "windows")]
-    {
-        use winreg::enums::*;
-        use winreg::RegKey;
-        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-        // exe 路径用引号包起来，避免空格问题
-        let value = format!("\"{}\"", exe.display());
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let run_key = hkcu
-            .open_subkey_with_flags(
-                r"Software\Microsoft\Windows\CurrentVersion\Run",
-                KEY_SET_VALUE | KEY_QUERY_VALUE,
-            )
-            .map_err(|e| format!("open Run: {e}"))?;
-        run_key
-            .set_value("ClaudeUsageWidget", &value)
-            .map_err(|e| format!("set Run: {e}"))?;
-        eprintln!("[claude-usage-widget] autostart enabled → {}", value);
-        let _ = app;
-        Ok(true)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = app;
-        Ok(false)
-    }
+fn open_help_page() -> Result<(), String> {
+    open::that_detached(HELP_URL).map_err(|_| "open_failed".to_string())
 }
 
 #[tauri::command]
-fn disable_autostart() -> Result<bool, String> {
-    #[cfg(target_os = "windows")]
-    {
-        use winreg::enums::*;
-        use winreg::RegKey;
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let run_key = hkcu
-            .open_subkey_with_flags(
-                r"Software\Microsoft\Windows\CurrentVersion\Run",
-                KEY_SET_VALUE,
-            )
-            .map_err(|e| format!("open Run: {e}"))?;
-        match run_key.delete_value("ClaudeUsageWidget") {
-            Ok(_) => {
-                eprintln!("[claude-usage-widget] autostart disabled");
-                Ok(true)
+fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "window_unavailable".to_string())?;
+    window.hide().map_err(|_| "hide_failed".to_string())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WindowMode {
+    Expanded,
+    Collapsed,
+    Setup,
+}
+
+#[tauri::command]
+fn set_window_mode(app: tauri::AppHandle, mode: WindowMode) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "window_unavailable".to_string())?;
+    let (width, height) = match mode {
+        WindowMode::Expanded => (360.0, 244.0),
+        WindowMode::Collapsed => (360.0, 52.0),
+        WindowMode::Setup => (360.0, 328.0),
+    };
+    window
+        .set_size(tauri::LogicalSize::new(width, height))
+        .map_err(|_| "resize_failed".to_string())
+}
+
+#[tauri::command]
+fn read_active_model() -> ActiveModelInfo {
+    for name in ["MINIMAX_MODEL", "CLAUDE_MODEL", "ANTHROPIC_MODEL"] {
+        if let Ok(value) = std::env::var(name) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return ActiveModelInfo {
+                    model: Some(trimmed.to_string()),
+                    source: "env".to_string(),
+                };
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(format!("delete: {e}")),
         }
     }
-    #[cfg(not(target_os = "windows"))]
-    Ok(false)
-}
 
-#[tauri::command]
-fn is_autostart_enabled() -> bool {
-    #[cfg(target_os = "windows")]
+    if let Some(home) = std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())
     {
-        use winreg::enums::*;
-        use winreg::RegKey;
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        if let Ok(run_key) =
-            hkcu.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
-        {
-            return run_key.get_value::<String, _>("ClaudeUsageWidget").is_ok();
+        for filename in ["settings.json", "settings.local.json"] {
+            let path = std::path::PathBuf::from(&home)
+                .join(".claude")
+                .join(filename);
+            if let Ok(contents) = fs::read_to_string(path) {
+                if let Some(model) = extract_model_from_claude_settings(&contents) {
+                    return ActiveModelInfo {
+                        model: Some(model),
+                        source: "config".to_string(),
+                    };
+                }
+            }
         }
-        false
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        false
+
+    ActiveModelInfo {
+        model: None,
+        source: "none".to_string(),
     }
 }
 
-/// 检查 Claude Code 是否正在运行。
-/// Windows：用 Win32 EnumProcesses（不依赖 cmd.exe、不弹控制台窗口）。
-/// 其他平台：暂只做 Windows（项目本身就是 Win 优先）。
+fn extract_model_from_claude_settings(contents: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(contents).ok()?;
+
+    if let Some(model) = value.get("model").and_then(|item| item.as_str()) {
+        let trimmed = model.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    if let Some(model) = value
+        .get("model")
+        .and_then(|item| item.get("id"))
+        .and_then(|item| item.as_str())
+    {
+        let trimmed = model.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    if let Some(environment) = value.get("env").and_then(|item| item.as_object()) {
+        for name in ["MINIMAX_MODEL", "CLAUDE_MODEL", "ANTHROPIC_MODEL"] {
+            if let Some(model) = environment.get(name).and_then(|item| item.as_str()) {
+                let trimmed = model.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn is_claude_code_running() -> bool {
     #[cfg(target_os = "windows")]
     {
-        use windows::Win32::System::ProcessStatus::{
-            EnumProcesses, K32GetModuleFileNameExW,
-        };
-        use windows::Win32::System::Threading::{
-            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
         use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::ProcessStatus::{EnumProcesses, K32GetModuleFileNameExW};
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
         const MAX_PIDS: usize = 4096;
-        let mut pids = vec![0u32; MAX_PIDS];
-        let mut bytes_returned = 0u32;
-        // SAFETY: EnumProcesses 写入到 pids 缓冲区。我们传递足够大的缓冲区。
-        let result = unsafe {
-            EnumProcesses(pids.as_mut_ptr(), (MAX_PIDS * 4) as u32, &mut bytes_returned)
-        };
-        if result.is_err() {
+        let mut process_ids = vec![0_u32; MAX_PIDS];
+        let mut bytes_returned = 0_u32;
+        if unsafe {
+            EnumProcesses(
+                process_ids.as_mut_ptr(),
+                std::mem::size_of_val(process_ids.as_slice()) as u32,
+                &mut bytes_returned,
+            )
+        }
+        .is_err()
+        {
             return false;
         }
-        let n_pids = (bytes_returned as usize) / std::mem::size_of::<u32>();
-        for &pid in pids.iter().take(n_pids) {
-            if pid == 0 {
+
+        let process_count = bytes_returned as usize / std::mem::size_of::<u32>();
+        for process_id in process_ids.into_iter().take(process_count) {
+            if process_id == 0 {
                 continue;
             }
-            // SAFETY: OpenProcess 返回 Result<HANDLE>; 失败就是 0（无效句柄）
-            let handle_res = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) };
-            let handle = match handle_res {
-                Ok(h) => h,
-                Err(_) => continue,
+            let Ok(handle) =
+                (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) })
+            else {
+                continue;
             };
-            let mut buf = [0u16; 256];
-            // windows 0.58: K32GetModuleFileNameExW 接收 HANDLE 接口；
-            // 直接传 handle（HANDLE 类型）或 .into() 转。
-            let len = unsafe {
-                K32GetModuleFileNameExW(handle, None, &mut buf)
-            };
-            unsafe { let _ = CloseHandle(handle); }
-            if len == 0 { continue; }
-            let path = String::from_utf16_lossy(&buf[..len as usize]).to_lowercase();
-            if path.ends_with("\\claude.exe")
-                || path.ends_with("/claude.exe")
-                || path.contains("claude code")
+            let mut path_buffer = [0_u16; 32_768];
+            let path_length = unsafe { K32GetModuleFileNameExW(handle, None, &mut path_buffer) };
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            if path_length == 0 {
+                continue;
+            }
+
+            let path = String::from_utf16_lossy(&path_buffer[..path_length as usize]);
+            if std::path::Path::new(&path)
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("claude.exe"))
             {
                 return true;
             }
         }
         false
     }
+
     #[cfg(not(target_os = "windows"))]
     {
         false
     }
 }
 
-#[tauri::command]
-fn claude_code_running() -> bool {
-    is_claude_code_running()
-}
-
-#[tauri::command]
-fn set_autohide(_enabled: bool) {
-    // 前端 toggle 标记。简化：当前实现忽略此参数（永远检测）。
-    // 留接口以便未来实现"用户暂时关掉自动联动"。
-    let _ = _enabled;
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let client = build_http_client().expect("failed to build the HTTPS client");
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
+        .manage(ApiClient(client))
         .invoke_handler(tauri::generate_handler![
             fetch_minimax_usage,
-            frontend_log,
             probe_state,
             save_key_and_test,
-            open_url,
             clear_key,
-            claude_code_running,
-            set_autohide,
-            enable_autostart,
-            disable_autostart,
-            is_autostart_enabled,
-            read_plan_metadata,
+            open_help_page,
+            hide_main_window,
+            set_window_mode,
             read_active_model,
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
-                // 默认隐藏。Claude Code 在跑时，后台线程会把它 show 出来；
-                // Claude Code 关掉 → 隐藏。widget 永远不"独立"显示。
                 let _ = window.hide();
                 let _ = window.unminimize();
 
-                let monitor_size: Option<(u32, u32)> = window
-                    .primary_monitor()
-                    .ok()
-                    .flatten()
-                    .map(|m| {
-                        let s = m.size();
-                        (s.width, s.height)
-                    });
-
-                let win_size = window
+                let monitor_size = window.primary_monitor().ok().flatten().map(|monitor| {
+                    let size = monitor.size();
+                    (size.width, size.height)
+                });
+                let window_size = window
                     .inner_size()
-                    .unwrap_or(tauri::PhysicalSize::new(280, 200));
+                    .unwrap_or(tauri::PhysicalSize::new(360, 244));
 
-                if let Some((sw, sh)) = monitor_size {
-                    if sw > 0 && sh > 0 && win_size.width > 0 && win_size.height > 0 {
-                        let x = (sw as i32).saturating_sub(win_size.width as i32 + 24);
-                        let y = 48;
-                        let _ = window.set_position(tauri::PhysicalPosition::new(x.max(0), y));
-                        eprintln!(
-                            "[claude-usage-widget] positioned at ({}, {}), screen {}x{}, window {}x{}",
-                            x, y, sw, sh, win_size.width, win_size.height
-                        );
+                if let Some((screen_width, screen_height)) = monitor_size {
+                    if screen_width > 0
+                        && screen_height > 0
+                        && window_size.width > 0
+                        && window_size.height > 0
+                    {
+                        let x = (screen_width as i32).saturating_sub(window_size.width as i32 + 24);
+                        let _ = window.set_position(tauri::PhysicalPosition::new(x.max(0), 48));
                     }
                 }
 
-                // 启动后台线程：每 5s 检查 Claude Code 进程是否在跑
-                // 在 → show 窗口；不在 → hide
                 std::thread::spawn({
                     let window = window.clone();
-                    let mut claude_running = false;
+                    let mut was_running = false;
                     move || loop {
-                        std::thread::sleep(std::time::Duration::from_secs(5));
-                        let running = is_claude_code_running();
-                        if running != claude_running {
-                            if running {
+                        std::thread::sleep(Duration::from_secs(5));
+                        let is_running = is_claude_code_running();
+                        if is_running != was_running {
+                            if is_running {
                                 let _ = window.show();
-                                let _ = window.set_focus();
-                                eprintln!("[claude-usage-widget] claude.exe detected → show");
                             } else {
                                 let _ = window.hide();
-                                eprintln!("[claude-usage-widget] claude.exe gone → hide");
                             }
-                            claude_running = running;
+                            was_running = is_running;
                         }
                     }
                 });
@@ -698,5 +720,71 @@ pub fn run() {
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .expect("error while running Tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_api_key_shape_and_bounds() {
+        assert!(is_valid_api_key("sk-cp-12345678901234"));
+        assert!(!is_valid_api_key("sk-ant-12345678901234"));
+        assert!(!is_valid_api_key("sk-cp-short"));
+        assert!(!is_valid_api_key("sk-cp-12345678901234\n"));
+        assert!(!is_valid_api_key(&format!("sk-cp-{}", "x".repeat(600))));
+    }
+
+    #[test]
+    fn maps_remote_statuses_to_stable_error_codes() {
+        assert_eq!(
+            service_error_for_status(reqwest::StatusCode::UNAUTHORIZED).code(),
+            "unauthorized"
+        );
+        assert_eq!(
+            service_error_for_status(reqwest::StatusCode::TOO_MANY_REQUESTS).code(),
+            "rate_limited"
+        );
+        assert_eq!(
+            service_error_for_status(reqwest::StatusCode::BAD_GATEWAY).code(),
+            "service_unavailable"
+        );
+    }
+
+    #[test]
+    fn extracts_model_from_supported_claude_settings_shapes() {
+        assert_eq!(
+            extract_model_from_claude_settings(r#"{"model":"MiniMax-M2.5"}"#).as_deref(),
+            Some("MiniMax-M2.5")
+        );
+        assert_eq!(
+            extract_model_from_claude_settings(r#"{"model":{"id":"claude-sonnet"}}"#).as_deref(),
+            Some("claude-sonnet")
+        );
+        assert_eq!(
+            extract_model_from_claude_settings(r#"{"env":{"ANTHROPIC_MODEL":"claude-opus"}}"#)
+                .as_deref(),
+            Some("claude-opus")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn dpapi_round_trip_releases_native_buffers() {
+        let plaintext = b"sk-cp-test-only-1234567890";
+        let encrypted = windows_crypto::encrypt(plaintext).expect("DPAPI encryption should work");
+        let decrypted = windows_crypto::decrypt(&encrypted).expect("DPAPI decryption should work");
+        assert_eq!(decrypted.as_slice(), plaintext);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn atomic_key_write_replaces_existing_contents() {
+        let directory = tempfile::tempdir().expect("temp dir should be created");
+        let path = directory.path().join("key.bin");
+        keystore::write_atomically(&path, b"first").expect("first write should work");
+        keystore::write_atomically(&path, b"second").expect("replacement should work");
+        assert_eq!(fs::read(path).expect("key should be readable"), b"second");
+    }
 }

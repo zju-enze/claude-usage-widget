@@ -13,15 +13,16 @@
         "label": "main",
         "title": "Claude Usage Widget",
         "width": 360,
-        "height": 198,
-        "minWidth": 320,
-        "minHeight": 180,
-        "resizable": true,
+        "height": 244,
+        "minWidth": 340,
+        "minHeight": 52,
+        "resizable": false,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,
         "skipTaskbar": false,
         "shadow": false,
+        "visible": false,
         "dragDropEnabled": false,
         "backgroundColor": "#00000000",
         "x": null,
@@ -29,7 +30,19 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self'",
+        "connect-src": "ipc: http://ipc.localhost",
+        "font-src": "'self'",
+        "img-src": "'self' data:",
+        "style-src": "'self' 'unsafe-inline'",
+        "script-src": "'self'",
+        "object-src": "'none'",
+        "base-uri": "'none'",
+        "frame-src": "'none'",
+        "frame-ancestors": "'none'",
+        "form-action": "'none'"
+      }
     }
   },
   "bundle": {

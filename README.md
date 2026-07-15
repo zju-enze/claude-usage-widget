@@ -1,201 +1,102 @@
 # Claude Usage Widget
 
-一个常驻桌面右上角的浮动卡片，显示 **MiniMax Token Plan** 的实时用量（5 小时窗口 + 7 天周配额 + 各模型剩余 % + 重置倒计时）。
+一个面向 Windows 的轻量桌面悬浮组件，用来查看 MiniMax Coding Plan 的 5 小时与 7 天用量、重置时间和 Claude Code 当前模型。
 
-后端数据来自 MiniMax Coding Plan 官方 API：
+应用直接读取 MiniMax 官方 API，不依赖 `claude-monitor`、state 文件或其他常驻中间层。
 
+## 主要功能
+
+- 类 Apple 液态玻璃风格：透明、无边框、置顶，并适配深浅色环境。
+- 显示 5 小时和 7 天窗口的**已用比例**、重置倒计时与最近更新时间。
+- 显示从 Claude Code 环境变量或配置文件中检测到的当前模型；无法可靠检测时明确显示“未检测到”。
+- 连接成功且窗口可见时，每 30 秒自动刷新；也可通过标题栏刷新按钮立即同步。
+- 支持展开、折叠为 52px 高的紧凑栏，以及双击标题区域切换折叠状态。
+- 通过“连接设置”更新或移除本机保存的 Key；环境变量提供的 Key 只提示来源，不会在界面中读取或显示。
+- 后台每 5 秒检测 `claude.exe`：Claude Code 启动时显示小组件，退出时自动隐藏。
+
+## 安装
+
+从 [GitHub Releases](https://github.com/zju-enze/claude-usage-widget/releases) 下载最新的 `.msi` 或 NSIS `.exe` 安装包并运行。
+
+首次连接时，在安全连接界面输入以 `sk-cp-` 开头的 MiniMax API Key。Key 验证通过后才会保存。
+
+标题栏关闭按钮只隐藏小组件，不退出后台进程；当 Claude Code 退出并再次启动时，小组件会重新显示。
+
+## API Key 与安全
+
+应用按以下顺序查找 Key：
+
+1. 进程环境变量 `MINIMAX_API_KEY` 或 `MINIMAX_CP_TOKEN`。
+2. Windows 当前用户环境变量中的同名字段。
+3. Windows 本机加密保存的 Key。
+
+环境变量优先于本机保存值。使用环境变量时，无需在界面中再次保存 Key；修改用户环境变量后请重新启动应用。
+
+在 Windows 上，界面保存的 Key 使用 Windows DPAPI 加密，密文位于：
+
+```text
+%APPDATA%\claude-usage-widget\key.bin
 ```
+
+DPAPI 密文绑定当前 Windows 用户，并非 AES-GCM 文件。应用不会把 Key 明文写入磁盘。
+
+Key 的网络用途只有验证和查询 MiniMax Coding Plan。后端使用仅 HTTPS、禁止重定向的客户端，并固定请求官方端点：
+
+```http
 GET https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains
 Authorization: Bearer <sk-cp-...>
 ```
 
-直接调用、返回 JSON、解析后渲染。不依赖 claude-monitor 之类的中间层。
+Key 不会发送到其他网络地址，也不会写入应用日志或回传到用量界面。
 
-## 字段预览
-
-```
-┌─ Claude Usage ───── ✕ ┐
-│ 5 小时                  │
-│ ▓▓▓░░░░░░░ 剩 60%        │
-│ 重置 2h 14m · 13:42–18:42│
-│ 7 天                    │
-│ ▓▓░░░░░░░░ 剩 12%        │
-│ 重置 4d 03h             │
-│ 模型 MiniMax-Text-01    │
-│ ▸ 各模型剩余 %           │
-└────────────────────────┘
-```
-
-进度条是"剩余 %"：绿色表示剩得多（≥60%）、黄色注意（30–60%）、红色要省着用（<30%）。
-
-## 环境要求
-
-- **Rust** stable（1.78+）
-- **Node.js** 18+
-- **WebView2**（Win11 / 较新的 Win10 预装）
-- **MiniMax Coding Plan**（Plus/Pro/Max 等 Token Plan 订阅），sk-cp key 一个
-
-## 安装
-
-普通用户走这里：到 [Releases](https://github.com/zju-enze/claude-usage-widget/releases) 下载 `.msi` 或 NSIS `.exe` 安装包：
-
-| 安装包 | 大小 | 行为 |
-|---|---|---|
-| `Claude Usage Widget_0.1.0_x64_en-US.msi` | ~4.5 MB | 标准 Windows Installer（推荐）；安装到 Program Files，安装完成界面默认勾选"启动 widget" |
-| `Claude Usage Widget_0.1.0_x64-setup.exe` | ~2.8 MB | NSIS 安装器，更轻量 |
-
-安装完会自动启动 widget。第一次启动会弹出 **setup 向导**，让你填 MiniMax sk-cp key（AES-256-GCM 加密存到 `%APPDATA%\.claude-usage-widget\key.bin`，非明文）。主区有 **"登录时自动启动"** 复选框 —— 勾选会在 `HKCU\...\Run\ClaudeUsageWidget` 加注册项，跟随系统启动，与 Claude Code 一同出现。
-
-**仓库开发者**走以下流程：
-
-```bash
-git clone https://github.com/zju-enze/claude-usage-widget.git
-cd claude-usage-widget
-npm install
-npm run tauri dev          # 调试模式
-npm run tauri build        # 出 msi + nsis 安装包到 src-tauri\target\release\bundle\
-```
-
-启动后悬浮窗自动出现在主屏右上角。**首次自动拉一次 API**，状态行会显示 `key=env · 18:42:01`。
-
-> 找不到 key 的话，进 https://platform.minimaxi.com/user-center/basic-information/interface-key 复制 sk-cp 开头的那个。
-
-## 数据怎么来的
-
-悬浮窗**每 30 秒**直接调用 MiniMax 官方 API：
-
-```
-GET https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains
-Authorization: Bearer <MINIMAX_API_KEY>
-referer: https://platform.minimaxi.com/
-```
-
-返回 JSON 长这样（节选）：
-
-```json
-{
-  "model_remains": [
-    {
-      "model_name": "MiniMax-Text-01",
-      "current_interval_total_count": 5000,
-      "current_interval_remaining_percent": 87,
-      "remains_time": 1234567,
-      "current_weekly_total_count": 50000,
-      "current_weekly_remaining_percent": 100,
-      "weekly_remains_time": 6789012,
-      "start_time": "2026-07-12T13:00:00+08:00",
-      "end_time":   "2026-07-12T18:00:00+08:00"
-    }
-  ]
-}
-```
-
-字段含义：
-
-| 字段 | 含义 |
-|---|---|
-| `current_interval_*` | 当前 5 小时窗口（默认）|
-| `current_weekly_*` | 当前 7 天窗口 |
-| `*_remaining_percent` | **剩余 %**（不是已用 %）|
-| `remains_time` / `weekly_remains_time` | 距下次重置的毫秒数 |
-
-进度条颜色：
-
-- 剩 ≥60% → 绿色（healthy）
-- 剩 30–60% → 黄色（warning）
-- 剩 <30% → 红色（urgent）
-
-## 开机自启（可选）
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\install-startup.ps1 -Install
-```
-
-安装两个启动项：
-
-- `ClaudeUsageMonitor.bat` — 后台跑 monitor 守护
-- `ClaudeUsageWidget.bat` — 启动悬浮窗（调用 `npm run tauri dev`）
-
-> ⚠️ `npm run tauri dev` 启动慢，每次重启都要等一会儿。建议先打包 release 版本再绑自启（见下节）。
-
-## 打包 release（推荐用于自启场景）
-
-```bash
-cd "F:/projects/claude-usage-widget"
-npm run tauri build
-```
-
-产物：
-
-- `src-tauri/target/release/claude-usage-widget.exe`（直接双击运行）
-- `src-tauri/target/release/bundle/{msi,nsis}/`（安装包）
-
-自启脚本里把 `npm run tauri dev` 换成 `start-exe.bat`，指向 release 下的 `.exe`：
-
-```bat
-@echo off
-start "" "F:\projects\claude-usage-widget\src-tauri\target\release\claude-usage-widget.exe"
-```
-
-## 字段说明
-
-| 字段 | 来源 | 说明 |
-|---|---|---|
-| **5h** | `limits.five_hour` | 当前 5 小时会话窗口 |
-| **7d** | `limits.seven_day` | 当前 7 天周配额（Pro/Max5/Max20 才有；custom 可能为 null） |
-| **消息** | `local.sent_messages` | 当前会话已发出消息数 |
-| **重置** | `limits.five_hour.resets_at` | 距下次重置倒计时 |
-| **模型分布** | `local.model_distribution` | 按 `family` 聚合的 token 占比 |
-
-颜色规则：
-
-- `>90%` 红色
-- `>70%` 黄色
-- 其它 绿色
-
-## 常用操作
+## 界面操作
 
 | 操作 | 方式 |
 |---|---|
-| **拖动** | 鼠标按住顶部标题栏 |
-| **刷新** | 标题栏 `⟳` 按钮 / 自动每 5 秒 |
-| **折叠** | `−` 按钮 — 收缩成 36px 小条 |
-| **关闭** | `×` 按钮 — 隐藏窗口（不退出进程） |
-| **再次显示** | 双击标题栏唤出，或重新执行启动脚本 |
+| 拖动 | 按住标题区域拖动 |
+| 刷新 | 点击标题栏刷新按钮；连接后默认每 30 秒自动刷新 |
+| 折叠 / 展开 | 点击“收起 / 展开”，或双击标题区域 |
+| 连接设置 | 更新或移除本机 DPAPI 密钥，查看环境变量来源提示 |
+| 隐藏 | 点击关闭按钮；不会退出后台进程 |
 
-## 常见问题
+进度条表示**已用百分比**：低于 70% 为绿色，70%–89% 为黄色，90% 及以上为红色。
 
-**Q: 标题栏显示 `未找到 state 文件`？**
-先单次跑一次 `claude-monitor --once --write-state` 生成文件，再启动悬浮窗。
+## 本地开发
 
-**Q: 数据一直不刷新？**
-monitor 没在持续运行。`scripts/start-monitor.bat` 或自己用 `claude-monitor --write-state --refresh-rate 5`。
+要求：
 
-**Q: `custom` 计划下 5h 显示不正常（百分比爆炸）？**
-`custom` 计划是基于你历史 P90 自动估的限额，第一次启动没有历史时会偏小。跑几天让 monitor 累积历史后会准。
+- Windows 10/11 与 WebView2
+- Node.js 18+
+- Rust stable 与 Windows MSVC 构建工具链
+- 可用的 MiniMax Coding Plan API Key
 
-**Q: 窗口被任务栏遮住 / 想后台？**
-Tauri 2 + Win11 上 `alwaysOnTop: true` + `skipTaskbar: true` 已配置。标题栏拖到任意位置，下方空白处双击会隐藏/显示。
-
-## 目录结构
-
+```powershell
+git clone https://github.com/zju-enze/claude-usage-widget.git
+cd claude-usage-widget
+npm install
+npm run tauri dev
 ```
+
+## 验证与构建
+
+```powershell
+npm test
+npm run check
+npm run check:rust
+npm run tauri build
+```
+
+`npm run check` 检查前端 JavaScript 语法，`npm test` 运行前端数据处理测试，`npm run check:rust` 检查全部 Rust targets。发布构建产物位于 `src-tauri\target\release\bundle\`。
+
+## 项目结构
+
+```text
 claude-usage-widget/
-├── src/                       # 前端 (HTML/CSS/JS)
-│   ├── index.html
-│   ├── main.js
-│   └── styles.css
-├── src-tauri/                 # Rust 后端
-│   ├── src/
-│   │   ├── main.rs
-│   │   └── lib.rs              # read_monitor_state 命令
-│   ├── tauri.conf.json         # 浮动窗配置（无边框、置顶）
-│   └── Cargo.toml
-├── scripts/
-│   ├── start-monitor.bat       # monitor 守护脚本
-│   ├── start-widget.bat        # 启动悬浮窗
-│   ├── hide-window.vbs         # 后台启动 vbs 包装
-│   └── install-startup.ps1     # 开机自启安装 / 卸载
+├── src/                    # HTML、液态玻璃样式和前端交互
+├── src-tauri/              # Tauri/Rust 后端、DPAPI 与窗口联动
+├── tests/                  # 前端数据处理测试
+├── scripts/                # Windows 辅助脚本
+├── package.json
 └── README.md
 ```
 

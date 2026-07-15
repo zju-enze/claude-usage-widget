@@ -1,388 +1,572 @@
-let invoke = null;
-let getCurrentWindow = null;
-try {
-  invoke = window.__TAURI__.core.invoke;
-  getCurrentWindow = window.__TAURI__.window.getCurrentWindow;
-} catch (e) {
-  document.body.innerHTML += '<pre style="color:red;padding:8px;font-size:10px">[FE_TOP_ERR] ' + e.message + '</pre>';
-}
-const tlog = (level, msg) => {
-  if (invoke) invoke("frontend_log", { level, msg }).catch(() => {});
-  console[level === "info" ? "log" : level]("[FE]", msg);
+import {
+  TIME_ZONE,
+  formatDuration,
+  formatLocalTime,
+  remainingToUsedPercent,
+  selectPrimaryUsage,
+} from "./usage-utils.js";
+
+const nativeInvoke = globalThis.__TAURI__?.core?.invoke;
+const hasNativeBridge = typeof nativeInvoke === "function";
+const REFRESH_MS = 30_000;
+
+const ERROR_MESSAGES = {
+  invalid_key_format: "Key 格式不正确，请检查后重试",
+  missing_key: "需要连接 MiniMax",
+  unauthorized: "Key 已失效，请更新连接",
+  rate_limited: "请求过于频繁，请稍后重试",
+  service_unavailable: "MiniMax 服务暂时不可用",
+  request_failed: "MiniMax 拒绝了本次请求",
+  response_too_large: "服务响应异常，请稍后重试",
+  invalid_response: "收到无法识别的用量数据",
+  network: "网络连接失败，点击刷新重试",
+  no_usage: "当前账户暂无可用用量数据",
+  storage_error: "本机加密保存失败",
+  storage_unsupported: "此平台不支持安全保存，请改用环境变量",
+  remove_failed: "移除本机 Key 失败",
+  open_failed: "无法打开帮助页面",
+  native_unavailable: "请在桌面应用中运行",
 };
-tlog("info", "main.js loaded, window=" + (getCurrentWindow ? "ok" : "MISSING"));
-tlog("info", "readyState=" + document.readyState + ", has-setup-overlay=" + !!document.getElementById("setup-overlay"));
 
-const REFRESH_MS = 30000; // 30s 远程拉一次（API 限速）
-const TZ = "Asia/Shanghai";
+const $ = (id) => document.getElementById(id);
 
-// ─── 工具 ──────────────────────────────────────────────
-function pct(n) { if (n == null) return null; return Math.max(0, Math.min(100, Number(n))); }
-function num(n) { if (n == null) return 0; return Number(n); }
-function fmt(n) {
-  if (n == null || isNaN(n)) return "—";
-  const v = Number(n);
-  if (v >= 1e8) return (v / 1e8).toFixed(1).replace(/\.0$/, "") + " 亿";
-  if (v >= 1e4) return (v / 1e4).toFixed(1).replace(/\.0$/, "") + " 万";
-  return v.toLocaleString("zh-CN");
-}
-function escapeHtml(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+let lastUpdatedAt = null;
+let refreshInFlight = false;
+let refreshFailed = false;
+let lastErrorCode = null;
+let pollingTimer = null;
+let keySource = "missing";
+let hasSavedKey = false;
+let setupMode = "initial";
+let collapsed = false;
+let clearConfirmTimer = null;
+let setupReturnFocus = null;
 
-function fmtDuration(ms) {
-  if (ms == null || ms <= 0) return "—";
-  // API 给的就是毫秒
-  const totalSec = Math.floor(ms / 1000);
-  const d = Math.floor(totalSec / 86400);
-  const h = Math.floor((totalSec % 86400) / 3600);
-  const m = Math.floor((totalSec % 3600) / 60);
-  if (d > 0) return `${d} 天 ${h} 时`;
-  if (h > 0) return `${h} 时 ${m} 分`;
-  return `${m} 分`;
+function invoke(command, args = {}) {
+  if (!hasNativeBridge) return Promise.reject(new Error("native_unavailable"));
+  return nativeInvoke(command, args);
 }
 
-function fmtTimeLocal(ms) {
-  if (!ms) return "—";
-  const v = Number(ms);
-  if (isNaN(v) || v <= 0) return "—";
-  // API 返回毫秒级 Unix 时间戳
-  return new Date(v).toLocaleTimeString("zh-CN", {
-    hour: "2-digit", minute: "2-digit", timeZone: TZ, hour12: false,
+function friendlyError(code) {
+  return ERROR_MESSAGES[code] ?? "操作未完成，请重试";
+}
+
+function errorCode(error) {
+  if (typeof error?.code === "string") return error.code;
+  if (typeof error?.message === "string" && ERROR_MESSAGES[error.message]) {
+    return error.message;
+  }
+  if (typeof error === "string" && ERROR_MESSAGES[error]) return error;
+  return "network";
+}
+
+function usageError(code) {
+  const error = new Error(code);
+  error.code = code;
+  return error;
+}
+
+function formatClock(date) {
+  return date.toLocaleTimeString("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+    timeZone: TIME_ZONE,
   });
 }
 
-// ─── 状态行（保留内部 lastUpdated 状态；不再写入可见底部） ─────
-let _lastUpdatedAt = null;          // Date | null —— 内部状态
-let _refreshInFlight = false;       // 防止叠加请求
-let _refreshFailed = false;         // 最近一次是否失败
+function updateLastUpdated() {
+  const element = $("last-updated");
+  if (!element) return;
 
-function setStatus(_msg, _isErr) {
-  // 旧版底部 env · time 状态行已删除。这里保留为空实现，
-  // 保证历史调用点不会崩。lastUpdated 状态用 _lastUpdatedAt 单独维护。
-}
-
-function setConnectionState(state) {
-  // state: "idle" | "loading" | "ok" | "warn" | "error"
-  const dot = document.getElementById("status-dot");
-  if (!dot) return;
-  dot.classList.remove("state-idle", "state-loading", "state-ok", "state-warn", "state-error");
-  dot.classList.add("state-" + state);
-  // 同步刷新按钮 tooltip 与 aria-label
-  updateRefreshTooltip();
+  if (!hasNativeBridge) {
+    element.textContent = "仅桌面应用可刷新";
+  } else if (refreshInFlight) {
+    element.textContent = "正在安全同步…";
+  } else if (refreshFailed && lastUpdatedAt) {
+    element.textContent = `数据截至 ${formatClock(lastUpdatedAt)}`;
+  } else if (refreshFailed && lastErrorCode) {
+    element.textContent = friendlyError(lastErrorCode);
+  } else if (lastUpdatedAt) {
+    element.textContent = `更新于 ${formatClock(lastUpdatedAt)}`;
+  } else {
+    element.textContent = "尚未同步";
+  }
 }
 
 function updateRefreshTooltip() {
-  const btn = document.getElementById("btn-refresh");
-  if (!btn) return;
-  let tip = "刷新用量";
-  const lines = [];
-  if (_refreshInFlight) {
-    lines.push("正在刷新…");
-  } else if (_refreshFailed) {
-    lines.push("刷新失败 · 点击重试");
-  } else if (_lastUpdatedAt) {
-    const ts = _lastUpdatedAt.toLocaleTimeString("zh-CN", {
-      hour: "2-digit", minute: "2-digit", second: "2-digit", timeZone: TZ, hour12: false,
-    });
-    lines.push(`上次更新：${ts}`);
-  } else {
-    lines.push("尚未刷新");
-  }
-  tip += "\n" + lines[0];
-  btn.setAttribute("title", tip);
-  btn.setAttribute("aria-label", tip.replace("\n", " · "));
+  const button = $("btn-refresh");
+  if (!button) return;
+
+  let detail = "尚未刷新";
+  if (!hasNativeBridge) detail = "仅桌面应用可刷新";
+  else if (refreshInFlight) detail = "正在刷新…";
+  else if (refreshFailed && lastErrorCode) detail = friendlyError(lastErrorCode);
+  else if (lastUpdatedAt) detail = `上次更新：${formatClock(lastUpdatedAt)}`;
+
+  const label = `刷新用量 · ${detail}`;
+  button.title = label;
+  button.setAttribute("aria-label", label);
 }
 
-// ─── 单条进度条 ──────────────────────────────────────────
-// 颜色：已用 ≤70% 绿、70–90% 黄、>90% 红
-function paintBar(fillId, pctId, subId, usedPct, resetMs, subText) {
-  const fillEl = document.getElementById(fillId);
-  const textEl = document.getElementById(pctId);
-  const subEl = document.getElementById(subId);
+function setConnectionState(state, message) {
+  const dot = $("status-dot");
+  const status = $("connection-status");
+  const refreshButton = $("btn-refresh");
+  const content = $("content");
 
-  if (usedPct == null || isNaN(usedPct)) {
-    fillEl.style.width = "0%";
-    fillEl.className = "bar-fill";
-    textEl.textContent = "无数据";
-    if (subEl) subEl.textContent = subText || "—";
-    return;
-  }
-  const v = Math.max(0, Math.min(100, Number(usedPct)));
-  const prev = fillEl.style.width;
-  fillEl.style.width = `${v}%`;
-  fillEl.className = "bar-fill " + (
-    v >= 90 ? "bad" : v >= 70 ? "warn" : "good"
-  );
-  textEl.textContent = `已用 ${v.toFixed(0)}%`;
-  if (subEl) subEl.textContent = subText || "—";
-  // 副文本里加 reset 倒计时
-  if (subEl && resetMs != null) {
-    const r = fmtDuration(resetMs);
-    if (r !== "—") subEl.textContent = `${subText || ""} · 重置 ${r}`.replace(/^\s·\s/, "");
-  }
-  // 仅在宽度变化时触发一次性光泽滑过
-  if (prev && prev !== `${v}%`) {
-    fillEl.classList.remove("is-shine");
-    void fillEl.offsetWidth;
-    fillEl.classList.add("is-shine");
-  }
-}
+  const defaultMessages = {
+    idle: "待同步",
+    loading: "同步中",
+    ok: "已同步",
+    warning: "需要连接",
+    error: "连接异常",
+    offline: "桌面预览",
+  };
 
-// ─── 套餐名称已不在 UI 展示 ─────────────────────────────
-//
-// 为什么完全没有套餐字段：
-//   API `/v1/api/openplatform/coding_plan/remains` 不返回套餐名称。
-//   公开的 minimaxi.com 开发者文档也未列出专门的套餐信息端点。
-//   在没有权威数据源时，"硬编码 + 显示" 就是编造数据，违反本项目"真实数据驱动"原则。
-//
-// 当前 UI 中已无套餐行。如果未来 minimaxi 提供返回套餐名的端点，
-// 实现 Rust 端 read_plan_metadata + 前端套餐行。
+  dot.className = `dot state-${state}`;
+  status.textContent = message || defaultMessages[state] || defaultMessages.idle;
+  status.title = status.textContent;
+  refreshButton.classList.toggle("is-spinning", state === "loading");
+  refreshButton.disabled = state === "loading" || !hasNativeBridge;
+  content.setAttribute("aria-busy", String(state === "loading"));
+  content.classList.toggle("is-stale", state === "error" && Boolean(lastUpdatedAt));
+  $("widget").dataset.connection = state;
 
-async function loadPlanMetadata() {
-  // 后端始终返回 None —— 调用保留以便将来扩展，但当前不做任何 UI 更新。
-  try { await invoke("read_plan_metadata"); } catch (e) { /* 静默 */ }
-}
-
-// ─── 当前模型读取 ───────────────────────────────────────
-// 严禁从 Token Plan API 的 model_name 字段推断当前模型。
-// 真实来源：环境变量 / Claude Code 配置文件（~/.claude/settings.json）。
-// 读取失败：隐藏整行而不是编造。
-async function loadActiveModel() {
-  const row = document.getElementById("model-row");
-  const pill = document.getElementById("model-name");
-  try {
-    const info = await invoke("read_active_model");
-    if (info && info.model && info.model.trim()) {
-      const m = info.model.trim();
-      pill.textContent = m;
-      pill.title = m;
-      pill.classList.remove("is-empty");
-      row.style.display = "";
-    } else {
-      pill.textContent = "未检测到";
-      pill.title = "无法可靠读取 Claude Code 当前模型";
-      pill.classList.add("is-empty");
-      row.style.display = "";
-    }
-  } catch (e) {
-    pill.textContent = "未检测到";
-    pill.title = "无法可靠读取 Claude Code 当前模型";
-    pill.classList.add("is-empty");
-    row.style.display = "";
-  }
-}
-
-// ─── 主刷新 ──────────────────────────────────────────────
-//
-// 数据来源与处理边界：
-//   - 5h / 7d 用量：来自 coding_plan/remains 的 model_remains[0]
-//     （primary = current_interval_status === 1，否则取第一条）
-//   - 当前模型：来自 read_active_model（环境变量 / Claude Code 配置），
-//     不再从 model_remains[].model_name 推断
-//   - 套餐：来自 read_plan_metadata（API 不返回套餐名，硬编码显示）
-//   - 各模型剩余 %：API 字段存在但本组件不再进入 ViewModel
-async function refresh() {
-  if (_refreshInFlight) return;
-  _refreshInFlight = true;
-  setConnectionState("loading");
-  try {
-    const snap = await invoke("fetch_minimax_usage");
-    if (!snap.found) {
-      _refreshFailed = true;
-      setConnectionState("error");
-      updateRefreshTooltip();
-      return;
-    }
-    const arr = snap.raw?.model_remains;
-    if (!Array.isArray(arr) || arr.length === 0) {
-      _refreshFailed = true;
-      setConnectionState("error");
-      updateRefreshTooltip();
-      return;
-    }
-
-    // primary 仅用于 5h / 7d 字段解析（接口里 status===1 表示主档）
-    const primary = arr.find(x => x.current_interval_status === 1) || arr[0];
-
-    // `start_time`/`end_time` 是毫秒级 Unix 时间戳；`remains_time` 是毫秒数。
-    function used(remaining) {
-      if (remaining == null) return null;
-      const v = Number(remaining);
-      // 直接用：API 返回 0–100 整数（已用% = 100 - 剩余%）
-      return Math.max(0, Math.min(100, 100 - v));
-    }
-
-    const fiveRem = primary.current_interval_remaining_percent;
-    const weekRem = primary.current_weekly_remaining_percent;
-    const fiveResetsMs = Number(primary.remains_time) || 0;
-    const weekResetsMs = Number(primary.weekly_remains_time) || 0;
-    const startMs = Number(primary.start_time);
-    const endMs   = Number(primary.end_time);
-
-    paintBar(
-      "fiveHour-fill", "fiveHour-pct", "fiveHour-resets",
-      used(fiveRem),
-      fiveResetsMs,
-      `${fmtTimeLocal(startMs)}–${fmtTimeLocal(endMs)}`,
-    );
-    paintBar(
-      "sevenDay-fill", "sevenDay-pct", "sevenDay-resets",
-      used(weekRem),
-      weekResetsMs,
-      "本周",
-    );
-
-    // 注意：不再写 #model-name（由 loadActiveModel 维护）
-
-    _lastUpdatedAt = new Date(snap.fetched_at);
-    _refreshFailed = false;
-    setConnectionState("ok");
-    updateRefreshTooltip();
-  } catch (e) {
-    _refreshFailed = true;
-    setConnectionState("error");
-    updateRefreshTooltip();
-  } finally {
-    _refreshInFlight = false;
-  }
-}
-
-function setupButtons() {
-  const win = getCurrentWindow();
-  const refreshBtn = document.getElementById("btn-refresh");
-  refreshBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    if (_refreshInFlight) return;
-    refresh();
-  });
-
-  document.getElementById("btn-collapse").addEventListener("click", async (e) => {
-    e.stopPropagation();
-    const w = document.getElementById("widget");
-    const collapsed = w.classList.toggle("collapsed");
-    const icon = document.querySelector("#btn-collapse svg");
-    if (icon) {
-      icon.style.transform = collapsed ? "rotate(45deg)" : "rotate(0deg)";
-    }
-    try {
-      await win.setSize(new (win.constructor || Object).Size(360, collapsed ? 44 : 198));
-    } catch {}
-  });
-
-  document.getElementById("btn-close").addEventListener("click", (e) => { e.stopPropagation(); win.hide(); });
-  document.querySelector("header").addEventListener("dblclick", (e) => {
-    e.stopPropagation();
-    if (win.isVisible()) win.hide(); else win.show();
-  });
-  // 初始 tooltip
+  updateLastUpdated();
   updateRefreshTooltip();
 }
 
-// ─── 启动探测 ──────────────────────────────────────────
-async function probe() {
-  try {
-    const state = await invoke("probe_state");
-    return state;
-  } catch (e) {
-    return { has_key: false, source: "error", error: String(e) };
-  }
-}
+function paintBar(fillId, valueId, trackId, descriptionId, usedPercent, resetMs, prefix) {
+  const fill = $(fillId);
+  const value = $(valueId);
+  const track = $(trackId);
+  const description = $(descriptionId);
 
-function showSetup(show) {
-  tlog("info", "showSetup(" + show + ")");
-  const overlay = document.getElementById("setup-overlay");
-  tlog("info", "overlay el: " + !!overlay);
-  if (!overlay) return;
-  overlay.classList.toggle("hidden", !show);
-  const content = document.getElementById("content");
-  if (content) content.style.opacity = show ? "0.25" : "1";
-  const hdr = document.querySelector("header");
-  if (hdr) hdr.style.opacity = show ? "0.25" : "1";
-  if (show) {
-    setTimeout(() => {
-      const i = document.getElementById("setup-key-input");
-      if (i) i.focus();
-    }, 100);
-  }
-}
-
-async function submitSetup() {
-  const input = document.getElementById("setup-key-input");
-  const errEl = document.getElementById("setup-error");
-  const btn = document.getElementById("setup-submit");
-  const key = input.value.trim();
-  errEl.textContent = "";
-  if (!key || !key.startsWith("sk-cp-") || key.length < 20) {
-    errEl.textContent = "sk-cp key 应该以 'sk-cp-' 开头";
+  if (!Number.isFinite(usedPercent)) {
+    fill.style.width = "0%";
+    fill.className = "bar-fill is-empty";
+    fill.dataset.value = "";
+    value.textContent = "暂无数据";
+    description.textContent = prefix || "等待首次同步";
+    track.removeAttribute("aria-valuenow");
+    track.setAttribute("aria-valuetext", "暂无数据");
     return;
   }
-  btn.disabled = true;
-  btn.textContent = "连接中…";
-  try {
-    const result = await invoke("save_key_and_test", { key });
-    if (result.ok) {
-      // 保存成功 → 隐藏 setup、开始刷新
-      input.value = "";
-      showSetup(false);
-      refresh();
-    } else {
-      errEl.textContent = `保存/测试失败：${result.error || "未知错误"}`;
-      btn.disabled = false;
-      btn.textContent = "连接并保存";
-    }
-  } catch (e) {
-    errEl.textContent = `出错了：${e}`;
-    btn.disabled = false;
-    btn.textContent = "连接并保存";
+
+  const normalized = Math.max(0, Math.min(100, Number(usedPercent)));
+  const rounded = Math.round(normalized);
+  const previous = fill.dataset.value;
+  fill.style.width = `${normalized}%`;
+  fill.dataset.value = String(normalized);
+  fill.className = `bar-fill ${normalized >= 90 ? "is-bad" : normalized >= 70 ? "is-warning" : "is-good"}`;
+  value.textContent = `已用 ${rounded}%`;
+  track.setAttribute("aria-valuenow", String(rounded));
+  track.setAttribute("aria-valuetext", `已使用 ${rounded}%`);
+
+  const reset = formatDuration(resetMs);
+  description.textContent = reset === "—" ? prefix : `${prefix} · ${reset} 后重置`;
+
+  if (previous && previous !== String(normalized)) {
+    fill.classList.remove("is-shine");
+    requestAnimationFrame(() => fill.classList.add("is-shine"));
   }
 }
-// ─── 启动逻辑 ──────────────────────────────────────────
-// 1. 默认隐藏（Rust 端 setup 阶段已经 hide）
-// 2. 后台线程每 5s 查 claude.exe：
-//    - 启动 → show
-//    - 关闭 → hide
-// 所以 widget 永远不"独立"显示 —— 只能跟随 Claude Code 出现。
 
-function setupSetupHandlers() {
-  document.getElementById("setup-submit").addEventListener("click", (e) => { e.stopPropagation(); submitSetup(); });
-  document.getElementById("setup-key-input").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.stopPropagation(); submitSetup(); }
-    e.stopPropagation(); // 防止被 Tauri drag region 拦截
+function clearUsage(message = "连接后显示") {
+  paintBar("fiveHour-fill", "fiveHour-pct", "fiveHour-track", "fiveHour-resets", null, 0, message);
+  paintBar("sevenDay-fill", "sevenDay-pct", "sevenDay-track", "sevenDay-resets", null, 0, message);
+}
+
+async function loadActiveModel() {
+  const model = $("model-name");
+  if (!hasNativeBridge) {
+    model.textContent = "待桌面检测";
+    model.title = "模型仅能在桌面应用中检测";
+    model.classList.add("is-empty");
+    return;
+  }
+
+  try {
+    const info = await invoke("read_active_model");
+    const name = info?.model?.trim();
+    if (name) {
+      model.textContent = name;
+      model.title = name;
+      model.classList.remove("is-empty");
+    } else {
+      model.textContent = "未检测到";
+      model.title = "未在 Claude Code 配置中检测到模型";
+      model.classList.add("is-empty");
+    }
+  } catch {
+    model.textContent = "未检测到";
+    model.title = "读取 Claude Code 模型失败";
+    model.classList.add("is-empty");
+  }
+}
+
+async function refresh() {
+  if (!hasNativeBridge) {
+    setConnectionState("offline");
+    return;
+  }
+  if (refreshInFlight) return;
+
+  refreshInFlight = true;
+  setConnectionState("loading");
+  let finalState = "error";
+  let finalMessage = "连接异常";
+  let shouldOpenSetup = false;
+
+  try {
+    const snapshot = await invoke("fetch_minimax_usage");
+    if (!snapshot?.found) throw usageError(snapshot?.error || "invalid_response");
+
+    keySource = snapshot.key_source || keySource;
+    const primary = selectPrimaryUsage(snapshot.raw?.model_remains);
+    if (!primary) throw usageError("no_usage");
+
+    const intervalStart = formatLocalTime(primary.start_time);
+    const intervalEnd = formatLocalTime(primary.end_time);
+    const intervalLabel = intervalStart === "—" || intervalEnd === "—"
+      ? "本周期"
+      : `${intervalStart}–${intervalEnd}`;
+
+    paintBar(
+      "fiveHour-fill",
+      "fiveHour-pct",
+      "fiveHour-track",
+      "fiveHour-resets",
+      remainingToUsedPercent(primary.current_interval_remaining_percent),
+      Number(primary.remains_time),
+      intervalLabel,
+    );
+    paintBar(
+      "sevenDay-fill",
+      "sevenDay-pct",
+      "sevenDay-track",
+      "sevenDay-resets",
+      remainingToUsedPercent(primary.current_weekly_remaining_percent),
+      Number(primary.weekly_remains_time),
+      "本周",
+    );
+
+    const fetchedAt = new Date(snapshot.fetched_at);
+    lastUpdatedAt = Number.isNaN(fetchedAt.getTime()) ? new Date() : fetchedAt;
+    refreshFailed = false;
+    lastErrorCode = null;
+    finalState = "ok";
+    finalMessage = "已同步";
+  } catch (error) {
+    lastErrorCode = errorCode(error);
+    refreshFailed = true;
+    finalMessage = friendlyError(lastErrorCode);
+    shouldOpenSetup = lastErrorCode === "missing_key";
+  } finally {
+    refreshInFlight = false;
+    setConnectionState(finalState, finalMessage);
+  }
+
+  if (shouldOpenSetup) {
+    stopPolling();
+    await showSetup(true, "initial", "missing");
+  }
+}
+
+function stopPolling() {
+  if (pollingTimer !== null) {
+    clearInterval(pollingTimer);
+    pollingTimer = null;
+  }
+}
+
+function startPolling() {
+  stopPolling();
+  if (!hasNativeBridge || keySource === "missing" || document.hidden) return;
+  pollingTimer = window.setInterval(refresh, REFRESH_MS);
+}
+
+async function setWindowMode(mode) {
+  if (!hasNativeBridge) return;
+  try {
+    await invoke("set_window_mode", { mode });
+  } catch {
+    // The CSS state remains usable even when the native resize is unavailable.
+  }
+}
+
+function resetClearConfirmation() {
+  if (clearConfirmTimer !== null) {
+    clearTimeout(clearConfirmTimer);
+    clearConfirmTimer = null;
+  }
+  const button = $("setup-clear");
+  button.dataset.armed = "false";
+  button.textContent = button.dataset.defaultLabel || "移除本机密钥";
+  button.classList.remove("is-danger");
+}
+
+async function showSetup(show, mode = "manage", source = keySource) {
+  const overlay = $("setup-overlay");
+  const header = $("widget-header");
+  const content = $("content");
+  const input = $("setup-key-input");
+  const toggle = $("setup-toggle-key");
+  const submit = $("setup-submit");
+  const clear = $("setup-clear");
+  const cancel = $("setup-cancel");
+
+  if (!show) {
+    overlay.classList.add("hidden");
+    overlay.setAttribute("aria-hidden", "true");
+    header.inert = false;
+    content.inert = false;
+    input.value = "";
+    input.type = "password";
+    await setWindowMode(collapsed ? "collapsed" : "expanded");
+    startPolling();
+    if (setupReturnFocus?.isConnected) setupReturnFocus.focus();
+    setupReturnFocus = null;
+    return;
+  }
+
+  stopPolling();
+  const opening = overlay.classList.contains("hidden");
+  if (opening) {
+    setupReturnFocus = mode === "manage" && document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+  }
+  setupMode = mode;
+  keySource = source;
+  $("setup-error").textContent = "";
+  input.setAttribute("aria-invalid", "false");
+  input.value = "";
+  input.type = "password";
+  toggle.textContent = "显示";
+  toggle.setAttribute("aria-label", "显示 API Key");
+
+  const usesEnvironment = source === "env";
+  $("setup-title").textContent = usesEnvironment
+    ? "环境变量已连接"
+    : mode === "initial" ? "连接 MiniMax" : "更新连接";
+  $("setup-description").textContent = usesEnvironment
+    ? "当前 Key 由系统环境变量提供。为避免来源冲突，请在环境变量中修改或移除。"
+    : "输入你的 MiniMax API Key，以读取 Coding Plan 用量。";
+  $("setup-security").textContent = usesEnvironment
+    ? "支持 MINIMAX_API_KEY 或 MINIMAX_CP_TOKEN；应用不会在界面中读取或显示其内容。"
+    : "验证和查询时只发送至 MiniMax 官方 HTTPS 接口；Windows 使用系统凭据加密后保存在本机。";
+
+  input.disabled = usesEnvironment;
+  toggle.disabled = usesEnvironment;
+  submit.classList.toggle("hidden", usesEnvironment);
+  clear.dataset.defaultLabel = usesEnvironment
+    ? "移除本机备用密钥"
+    : "移除本机密钥";
+  resetClearConfirmation();
+  clear.classList.toggle("hidden", !hasSavedKey);
+  cancel.textContent = mode === "initial" ? "隐藏小组件" : "返回";
+
+  overlay.classList.remove("hidden");
+  overlay.setAttribute("aria-hidden", "false");
+  header.inert = true;
+  content.inert = true;
+  await setWindowMode("setup");
+
+  window.setTimeout(() => {
+    (usesEnvironment ? cancel : input).focus();
+  }, 80);
+}
+
+async function submitSetup(event) {
+  event.preventDefault();
+  const input = $("setup-key-input");
+  const errorElement = $("setup-error");
+  const submit = $("setup-submit");
+  const candidate = input.value.trim();
+
+  errorElement.textContent = "";
+  input.setAttribute("aria-invalid", "false");
+  if (!candidate.startsWith("sk-cp-") || candidate.length < 20 || candidate.length > 512) {
+    errorElement.textContent = friendlyError("invalid_key_format");
+    input.setAttribute("aria-invalid", "true");
+    input.focus();
+    return;
+  }
+
+  submit.disabled = true;
+  submit.textContent = "正在验证…";
+  try {
+    const result = await invoke("save_key_and_test", { key: candidate });
+    if (!result?.ok) throw usageError(result?.error || "storage_error");
+
+    keySource = "saved";
+    hasSavedKey = true;
+    await showSetup(false);
+    await refresh();
+    startPolling();
+  } catch (error) {
+    const code = errorCode(error);
+    errorElement.textContent = friendlyError(code);
+    input.setAttribute("aria-invalid", "true");
+  } finally {
+    submit.disabled = false;
+    submit.textContent = "验证并保存";
+  }
+}
+
+async function manageKey() {
+  let source = keySource;
+  try {
+    const state = await invoke("probe_state");
+    source = state?.source || source;
+    hasSavedKey = Boolean(state?.has_saved_key);
+  } catch {
+    source = keySource;
+  }
+  await showSetup(true, "manage", source);
+}
+
+async function clearSavedKey() {
+  const button = $("setup-clear");
+  if (button.dataset.armed !== "true") {
+    button.dataset.armed = "true";
+    button.textContent = "再次点击确认移除";
+    button.classList.add("is-danger");
+    clearConfirmTimer = window.setTimeout(resetClearConfirmation, 5_000);
+    return;
+  }
+
+  button.disabled = true;
+  try {
+    await invoke("clear_key");
+    hasSavedKey = false;
+    if (keySource === "env") {
+      await showSetup(true, "manage", "env");
+      return;
+    }
+    keySource = "missing";
+    stopPolling();
+    lastUpdatedAt = null;
+    refreshFailed = false;
+    lastErrorCode = null;
+    clearUsage();
+    setConnectionState("warning", "等待连接");
+    await showSetup(true, "initial", "missing");
+  } catch (error) {
+    $("setup-error").textContent = friendlyError(errorCode(error));
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function hideWidget() {
+  stopPolling();
+  const input = $("setup-key-input");
+  input.value = "";
+  input.type = "password";
+  $("setup-toggle-key").textContent = "显示";
+  $("setup-toggle-key").setAttribute("aria-label", "显示 API Key");
+  try {
+    await invoke("hide_main_window");
+  } catch {
+    // Native hiding is unavailable in a normal browser preview.
+  }
+}
+
+async function toggleCollapsed() {
+  if (!$("setup-overlay").classList.contains("hidden")) return;
+  collapsed = !collapsed;
+  $("widget").classList.toggle("is-collapsed", collapsed);
+  const button = $("btn-collapse");
+  button.textContent = collapsed ? "展开" : "收起";
+  button.title = collapsed ? "展开小组件" : "收起小组件";
+  button.setAttribute("aria-label", button.title);
+  button.setAttribute("aria-expanded", String(!collapsed));
+  await setWindowMode(collapsed ? "collapsed" : "expanded");
+}
+
+function setupInteractions() {
+  $("btn-refresh").addEventListener("click", refresh);
+  $("btn-collapse").addEventListener("click", toggleCollapsed);
+  $("btn-close").addEventListener("click", hideWidget);
+  $("btn-manage-key").addEventListener("click", manageKey);
+  $("setup-form").addEventListener("submit", submitSetup);
+  $("setup-clear").addEventListener("click", clearSavedKey);
+
+  $("setup-toggle-key").addEventListener("click", () => {
+    const input = $("setup-key-input");
+    const reveal = input.type === "password";
+    input.type = reveal ? "text" : "password";
+    $("setup-toggle-key").textContent = reveal ? "隐藏" : "显示";
+    $("setup-toggle-key").setAttribute("aria-label", `${reveal ? "隐藏" : "显示"} API Key`);
+    input.focus();
   });
-  document.getElementById("setup-help").addEventListener("click", (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    invoke("open_url", { url: "https://platform.minimaxi.com/user-center/basic-information/interface-key" }).catch(() => {});
+
+  $("setup-help").addEventListener("click", async () => {
+    try {
+      await invoke("open_help_page");
+    } catch {
+      $("setup-error").textContent = friendlyError("open_failed");
+    }
+  });
+
+  $("setup-cancel").addEventListener("click", async () => {
+    if (setupMode === "initial") await hideWidget();
+    else await showSetup(false);
+  });
+
+  $("widget-header").addEventListener("dblclick", (event) => {
+    if (!event.target.closest("button")) toggleCollapsed();
+  });
+
+  document.addEventListener("keydown", async (event) => {
+    if (event.key !== "Escape" || $("setup-overlay").classList.contains("hidden")) return;
+    event.preventDefault();
+    if (setupMode === "initial") await hideWidget();
+    else await showSetup(false);
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopPolling();
+    else if (keySource !== "missing") {
+      refresh();
+      startPolling();
+    }
   });
 }
 
 async function init() {
+  setupInteractions();
+  clearUsage("等待首次同步");
+  setConnectionState("idle");
+  await loadActiveModel();
+
+  if (!hasNativeBridge) {
+    $("btn-manage-key").disabled = true;
+    setConnectionState("offline", "桌面预览");
+    return;
+  }
+
   try {
-    tlog("info", "init: start");
-    setupButtons();
-    tlog("info", "init: setupButtons done");
-    setupSetupHandlers();
-    tlog("info", "init: setupSetupHandlers done");
-
-    // 套餐 + 当前模型：与用量解耦，独立加载
-    await Promise.all([loadPlanMetadata(), loadActiveModel()]);
-
-    setConnectionState("idle");
-    const probeResult = await probe();
-    tlog("info", "init: probe_state returned " + JSON.stringify(probeResult));
-    if (!probeResult.has_key) {
-      showSetup(true);
-    } else {
-      refresh();
-      setInterval(refresh, REFRESH_MS);
+    const state = await invoke("probe_state");
+    keySource = state?.source || "missing";
+    hasSavedKey = Boolean(state?.has_saved_key);
+    if (!state?.has_key) {
+      setConnectionState("warning", "等待连接");
+      await showSetup(true, "initial", "missing");
+      return;
     }
-  } catch (e) {
-    tlog("error", "init failed: " + e.message);
-    document.body.innerHTML += '<pre style="color:red;padding:10px;font-size:11px;">[BOOT_ERR] ' + e.message + '</pre>';
+
+    await showSetup(false);
+    await refresh();
+    startPolling();
+  } catch {
+    setConnectionState("error", "初始化失败");
+    await showSetup(true, "initial", "missing");
   }
 }
 
-if (document.readyState === "loading") {
-  window.addEventListener("DOMContentLoaded", () => init());
-} else {
-  init();
-}
+init();

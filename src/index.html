@@ -2,37 +2,37 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <link rel="stylesheet" href="styles.css" />
     <title>Claude Usage Widget</title>
   </head>
   <body>
     <div id="widget" data-tauri-drag-region>
-
-      <header data-tauri-drag-region>
+      <header id="widget-header" data-tauri-drag-region>
         <div class="title" data-tauri-drag-region>
           <span class="app-icon" data-tauri-drag-region aria-hidden="true">
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M12 2 L4 6 L4 14 C4 18 7.5 21 12 22 C16.5 21 20 18 20 14 L20 6 Z" />
             </svg>
           </span>
-          <span class="dot state-idle" id="status-dot" data-tauri-drag-region aria-hidden="true"></span>
           <span class="title-text" data-tauri-drag-region>Claude Usage</span>
+          <span class="connection-state" data-tauri-drag-region>
+            <span class="dot state-idle" id="status-dot" aria-hidden="true"></span>
+            <span id="connection-status" aria-live="polite">待同步</span>
+          </span>
         </div>
+
         <div class="header-actions">
           <button id="btn-refresh" class="icon-btn" type="button" title="刷新用量" aria-label="刷新用量">
-            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21 12a9 9 0 1 1-3-6.7" />
               <polyline points="21 4 21 10 15 10" />
             </svg>
           </button>
-          <button id="btn-collapse" class="icon-btn" type="button" title="折叠 / 展开" aria-label="折叠 / 展开">
-            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
-              <line x1="5" y1="12" x2="19" y2="12" />
-            </svg>
-          </button>
-          <button id="btn-close" class="icon-btn icon-btn-close" type="button" title="关闭" aria-label="关闭">
-            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+          <button id="btn-collapse" class="glass-text-btn" type="button" title="收起小组件" aria-label="收起小组件" aria-expanded="true">收起</button>
+          <button id="btn-close" class="icon-btn icon-btn-close" type="button" title="隐藏小组件" aria-label="隐藏小组件">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
               <line x1="6" y1="6" x2="18" y2="18" />
               <line x1="18" y1="6" x2="6" y2="18" />
             </svg>
@@ -40,67 +40,106 @@
         </div>
       </header>
 
-      <main id="content">
-        <section class="bar-block" id="block-5h">
-          <div class="bar-label">
-            <span class="left">5 小时</span>
-            <span class="right"><span class="pct-tag" id="fiveHour-pct">—</span></span>
+      <main id="content" aria-busy="false">
+        <section class="usage-block" aria-labelledby="five-hour-label">
+          <div class="usage-heading">
+            <h2 id="five-hour-label">5 小时</h2>
+            <output class="pct-tag" id="fiveHour-pct">等待数据</output>
           </div>
-          <div class="bar-bg">
-            <div class="bar-fill" id="fiveHour-fill" style="width:0%">
+          <div
+            class="bar-track"
+            id="fiveHour-track"
+            role="progressbar"
+            aria-labelledby="five-hour-label"
+            aria-describedby="fiveHour-resets"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuetext="暂无数据"
+          >
+            <div class="bar-fill" id="fiveHour-fill">
               <span class="bar-fill-gloss"></span>
             </div>
           </div>
-          <div class="bar-sub" id="fiveHour-resets">—</div>
+          <p class="bar-sub" id="fiveHour-resets">等待首次同步</p>
         </section>
 
-        <section class="bar-block" id="block-7d">
-          <div class="bar-label">
-            <span class="left">7 天</span>
-            <span class="right"><span class="pct-tag" id="sevenDay-pct">—</span></span>
+        <section class="usage-block" aria-labelledby="seven-day-label">
+          <div class="usage-heading">
+            <h2 id="seven-day-label">7 天</h2>
+            <output class="pct-tag" id="sevenDay-pct">等待数据</output>
           </div>
-          <div class="bar-bg">
-            <div class="bar-fill" id="sevenDay-fill" style="width:0%">
+          <div
+            class="bar-track"
+            id="sevenDay-track"
+            role="progressbar"
+            aria-labelledby="seven-day-label"
+            aria-describedby="sevenDay-resets"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuetext="暂无数据"
+          >
+            <div class="bar-fill" id="sevenDay-fill">
               <span class="bar-fill-gloss"></span>
             </div>
           </div>
-          <div class="bar-sub" id="sevenDay-resets">—</div>
+          <p class="bar-sub" id="sevenDay-resets">等待首次同步</p>
         </section>
 
-        <div class="meta-block">
+        <section class="meta-panel" aria-label="连接信息">
           <div class="meta-row" id="model-row">
             <span class="meta-row-label">当前模型</span>
-            <span class="model-pill" id="model-name" title="未检测到">未检测到</span>
+            <span class="model-pill is-empty" id="model-name" title="未检测到">未检测到</span>
           </div>
-          <!--
-            套餐行已删除：
-            API `/v1/api/openplatform/coding_plan/remains` 不返回套餐名称；
-            后端 read_plan_metadata 当前返回 None。
-            在没有权威数据源时，宁可隐藏也不编造套餐名/徽标。
-          -->
-        </div>
+          <div class="meta-footer">
+            <span id="last-updated">尚未同步</span>
+            <button id="btn-manage-key" class="link-btn" type="button">连接设置</button>
+          </div>
+        </section>
       </main>
 
-      <!-- 首次启动 setup 向导 -->
-      <div class="setup-overlay hidden" id="setup-overlay">
-        <div class="setup-eyebrow">Claude Usage Widget</div>
-        <div class="setup-title">连接 MiniMax</div>
-        <div class="setup-sub">需要你的 MiniMax sk-cp key。<br>仅本机加密存储，不会上传。</div>
-        <input
-          id="setup-key-input"
-          class="setup-input"
-          type="password"
-          placeholder="sk-cp-..."
-          autocomplete="off"
-          spellcheck="false"
-        />
-        <button id="setup-submit" class="setup-btn">连接并保存</button>
-        <div id="setup-error" class="setup-error"></div>
-        <a class="setup-link" href="#" id="setup-help">如何获取 sk-cp key？</a>
-      </div>
+      <section
+        class="setup-overlay hidden"
+        id="setup-overlay"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="setup-title"
+        aria-describedby="setup-description setup-security"
+        aria-hidden="true"
+      >
+        <form id="setup-form" class="setup-card" novalidate>
+          <p class="setup-eyebrow">安全连接</p>
+          <h1 class="setup-title" id="setup-title">连接 MiniMax</h1>
+          <p class="setup-description" id="setup-description">输入你的 MiniMax API Key，以读取 Coding Plan 用量。</p>
 
+          <label class="setup-label" for="setup-key-input">MiniMax API Key</label>
+          <div class="setup-input-row">
+            <input
+              id="setup-key-input"
+              class="setup-input"
+              type="password"
+              placeholder="sk-cp-..."
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+              maxlength="512"
+              aria-describedby="setup-security setup-error"
+            />
+            <button id="setup-toggle-key" class="input-action" type="button" aria-label="显示 API Key">显示</button>
+          </div>
+
+          <p class="setup-security" id="setup-security">验证和查询时只发送至 MiniMax 官方 HTTPS 接口；Windows 使用系统凭据加密后保存在本机。</p>
+          <p id="setup-error" class="setup-error" role="alert" aria-live="assertive"></p>
+
+          <button id="setup-submit" class="setup-submit" type="submit">验证并保存</button>
+          <div class="setup-actions">
+            <button class="text-btn" type="button" id="setup-help">获取密钥</button>
+            <button class="text-btn hidden" type="button" id="setup-clear">移除本机密钥</button>
+            <button class="text-btn" type="button" id="setup-cancel">稍后</button>
+          </div>
+        </form>
+      </section>
     </div>
 
-    <script src="main.js" defer></script>
+    <script type="module" src="main.js"></script>
   </body>
 </html>
