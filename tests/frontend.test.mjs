@@ -201,3 +201,41 @@ test("switching to an already connected provider refreshes immediately", async (
 
   assert.match(main, /if \(state\.has_key\) \{[\s\S]{0,220}await refresh\(\);/);
 });
+
+test("provider switching remains interruptible and stale probes cannot repaint", async () => {
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  const main = await fs.readFile(path.join(process.cwd(), "src", "main.js"), "utf8");
+
+  assert.match(main, /button\.disabled = setupSubmitInFlight/);
+  assert.ok(!main.includes("providerSwitchInFlight || setupSubmitInFlight) return"));
+  assert.match(main, /const selectionRevision = providerRevision/);
+  assert.ok(
+    [...main.matchAll(/selectionRevision !== providerRevision/g)].length >= 3,
+    "async provider results must be revision-guarded before repainting",
+  );
+  assert.match(main, /activeRefreshProviderRevision === refreshRevision/);
+  assert.match(main, /const requestRevision = \+\+refreshRequestRevision/);
+  assert.ok(
+    [...main.matchAll(/requestRevision !== refreshRequestRevision/g)].length >= 2,
+    "stale refresh success and failure paths must both be ignored",
+  );
+});
+
+test("collapse motion is reversible and native window size is latest-wins", async () => {
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  const [main, styles] = await Promise.all([
+    fs.readFile(path.join(process.cwd(), "src", "main.js"), "utf8"),
+    fs.readFile(path.join(process.cwd(), "src", "styles.css"), "utf8"),
+  ]);
+
+  assert.match(main, /let collapseTransitionRevision = 0/);
+  assert.match(main, /collapseTarget = !collapseTarget/);
+  assert.match(main, /reconcileCollapsedWindowMode/);
+  assert.match(
+    styles,
+    /#widget\.is-collapsed main\s*\{[\s\S]{0,260}opacity:\s*0;[\s\S]{0,260}visibility:\s*hidden;/,
+  );
+  assert.match(styles, /@media \(prefers-reduced-transparency: reduce\)/);
+});

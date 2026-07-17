@@ -59,6 +59,8 @@ const $ = (id) => document.getElementById(id);
 
 let lastUpdatedAt = null;
 let refreshInFlight = false;
+let activeRefreshProviderRevision = null;
+let refreshRequestRevision = 0;
 let refreshFailed = false;
 let lastErrorCode = null;
 let pollingTimer = null;
@@ -70,10 +72,13 @@ let providerRevision = 0;
 let providerSwitchInFlight = false;
 let setupSubmitInFlight = false;
 let collapsed = false;
+let collapseTarget = false;
+let collapseTransitionRevision = 0;
 let clearConfirmTimer = null;
 let setupReturnFocus = null;
 let liquidFrame = null;
 let liquidPoint = null;
+let setupTransitionRevision = 0;
 
 function invoke(command, args = {}) {
   if (!hasNativeBridge) return Promise.reject(new Error("native_unavailable"));
@@ -141,7 +146,7 @@ function syncSetupControlState() {
   if (!picker) return;
   const busy = providerSwitchInFlight || setupSubmitInFlight;
   picker.setAttribute("aria-busy", String(providerSwitchInFlight));
-  for (const button of providerButtons()) button.disabled = busy;
+  for (const button of providerButtons()) button.disabled = setupSubmitInFlight;
 
   const usesEnvironment = keySource === "env";
   $("setup-key-input").disabled = usesEnvironment || busy;
@@ -278,6 +283,7 @@ function paintMetric(slot, metric = {}) {
     fill.style.width = "0%";
     fill.className = "bar-fill is-empty";
     fill.dataset.value = "";
+    delete value.dataset.tone;
     value.textContent = metric.value || "暂无数据";
     description.textContent = metric.description || "等待首次同步";
     track.removeAttribute("aria-valuenow");
@@ -292,6 +298,7 @@ function paintMetric(slot, metric = {}) {
   fill.dataset.value = String(normalized);
   const tone = metric.tone || (normalized >= 90 ? "bad" : normalized >= 70 ? "warning" : "good");
   fill.className = `bar-fill is-${tone}`;
+  value.dataset.tone = tone;
   value.textContent = metric.value || `已用 ${rounded}%`;
   track.setAttribute("aria-valuenow", String(rounded));
   track.setAttribute("aria-valuetext", metric.ariaText || `已使用 ${rounded}%`);
@@ -369,6 +376,12 @@ function resetLiquidGlass() {
 function renderLiquidGlass() {
   liquidFrame = null;
   const widget = $("widget");
+  const motionReduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const highContrast = window.matchMedia("(prefers-contrast: more)").matches;
+  if (motionReduced || highContrast) {
+    resetLiquidGlass();
+    return;
+  }
   if (!liquidPoint || document.hidden || widget.classList.contains("is-setup-open")) return;
 
   const rect = widget.getBoundingClientRect();
@@ -406,11 +419,13 @@ async function refresh() {
     setConnectionState("offline");
     return;
   }
-  if (refreshInFlight) return;
-
-  refreshInFlight = true;
   const requestedProvider = currentProvider;
   const refreshRevision = providerRevision;
+  if (refreshInFlight && activeRefreshProviderRevision === refreshRevision) return;
+
+  const requestRevision = ++refreshRequestRevision;
+  refreshInFlight = true;
+  activeRefreshProviderRevision = refreshRevision;
   setConnectionState("loading");
   let finalState = "error";
   let finalMessage = "连接异常";
@@ -418,7 +433,10 @@ async function refresh() {
 
   try {
     const snapshot = await invoke("fetch_usage", { provider: requestedProvider });
-    if (refreshRevision !== providerRevision) return;
+    if (
+      refreshRevision !== providerRevision
+      || requestRevision !== refreshRequestRevision
+    ) return;
     if (!snapshot || snapshot.provider !== requestedProvider) {
       throw usageError("invalid_response");
     }
@@ -440,13 +458,20 @@ async function refresh() {
     finalState = "ok";
     finalMessage = "已同步";
   } catch (error) {
+    if (
+      refreshRevision !== providerRevision
+      || requestRevision !== refreshRequestRevision
+    ) return;
     lastErrorCode = errorCode(error);
     refreshFailed = true;
     finalMessage = friendlyError(lastErrorCode);
     shouldOpenSetup = lastErrorCode === "missing_key";
   } finally {
-    refreshInFlight = false;
-    if (refreshRevision === providerRevision) setConnectionState(finalState, finalMessage);
+    if (requestRevision === refreshRequestRevision) {
+      refreshInFlight = false;
+      activeRefreshProviderRevision = null;
+      if (refreshRevision === providerRevision) setConnectionState(finalState, finalMessage);
+    }
   }
 
   if (shouldOpenSetup) {
@@ -475,6 +500,47 @@ async function setWindowMode(mode) {
   } catch {
     // The CSS state remains usable even when the native resize is unavailable.
   }
+}
+
+function nextAnimationFrame() {
+  return new Promise((resolve) => requestAnimationFrame(resolve));
+}
+
+function cssTimeToMs(value) {
+  const parsed = Number.parseFloat(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return value.trim().endsWith("ms") ? parsed : parsed * 1000;
+}
+
+function transitionTime(element) {
+  const style = getComputedStyle(element);
+  const durations = style.transitionDuration.split(",").map(cssTimeToMs);
+  const delays = style.transitionDelay.split(",").map(cssTimeToMs);
+  return durations.reduce((maximum, duration, index) => {
+    const delay = delays[index % delays.length] || 0;
+    return Math.max(maximum, duration + delay);
+  }, 0);
+}
+
+function waitForTransition(element) {
+  const maximum = transitionTime(element);
+  if (maximum <= 0) return Promise.resolve();
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      element.removeEventListener("transitionend", onTransitionEnd);
+      resolve();
+    };
+    const onTransitionEnd = (event) => {
+      if (event.target === element) finish();
+    };
+    const timer = window.setTimeout(finish, maximum + 60);
+    element.addEventListener("transitionend", onTransitionEnd);
+  });
 }
 
 function resetClearConfirmation() {
@@ -532,7 +598,7 @@ function renderSetupContent(source = keySource, { resetInput = true } = {}) {
 }
 
 async function selectProvider(provider, { focus = true } = {}) {
-  if (!isKnownProvider(provider) || providerSwitchInFlight || setupSubmitInFlight) return;
+  if (!isKnownProvider(provider) || setupSubmitInFlight) return;
   if (provider === currentProvider) {
     renderProviderPicker({ focus });
     return;
@@ -541,6 +607,7 @@ async function selectProvider(provider, { focus = true } = {}) {
   stopPolling();
   providerSwitchInFlight = true;
   applyProvider(provider, { persist: true });
+  const selectionRevision = providerRevision;
   keySource = "missing";
   hasSavedKey = false;
   lastUpdatedAt = null;
@@ -549,11 +616,13 @@ async function selectProvider(provider, { focus = true } = {}) {
   clearUsage("正在检测连接");
   setConnectionState("loading", `检测 ${PROVIDERS[provider].name}`);
   renderSetupContent("missing");
+  renderProviderPicker({ focus });
   let switchError = null;
 
   try {
     if (!hasNativeBridge) throw usageError("native_unavailable");
     const state = await invoke("probe_state", { provider });
+    if (selectionRevision !== providerRevision) return;
     if (!state || state.provider !== provider || !isKnownProvider(state.provider)) {
       throw usageError("invalid_response");
     }
@@ -566,15 +635,18 @@ async function selectProvider(provider, { focus = true } = {}) {
     if (state.has_key) {
       setConnectionState("idle", `${PROVIDERS[provider].name} 已连接`);
       await refresh();
+      if (selectionRevision !== providerRevision) return;
     } else {
       setConnectionState("warning", `连接 ${PROVIDERS[provider].name}`);
     }
   } catch (error) {
+    if (selectionRevision !== providerRevision) return;
     keySource = "missing";
     hasSavedKey = false;
     switchError = friendlyError(errorCode(error));
     setConnectionState("error", "连接检测失败");
   } finally {
+    if (selectionRevision !== providerRevision) return;
     providerSwitchInFlight = false;
     renderSetupContent(keySource, { resetInput: false });
     if (switchError) $("setup-error").textContent = switchError;
@@ -583,22 +655,30 @@ async function selectProvider(provider, { focus = true } = {}) {
 }
 
 async function showSetup(show, mode = "manage", source = keySource) {
+  const transitionRevision = ++setupTransitionRevision;
   const overlay = $("setup-overlay");
+  const card = overlay.querySelector(".setup-card");
   const header = $("widget-header");
   const content = $("content");
   const input = $("setup-key-input");
   const cancel = $("setup-cancel");
-  $("widget").classList.toggle("is-setup-open", show);
-  if (show) resetLiquidGlass();
+  const widget = $("widget");
 
   if (!show) {
-    overlay.classList.add("hidden");
+    if (!overlay.classList.contains("hidden")) {
+      overlay.classList.remove("is-visible");
+      await Promise.all([waitForTransition(overlay), waitForTransition(card)]);
+      if (transitionRevision !== setupTransitionRevision) return;
+      overlay.classList.add("hidden");
+    }
     overlay.setAttribute("aria-hidden", "true");
+    widget.classList.remove("is-setup-open");
     header.inert = false;
     content.inert = false;
     input.value = "";
     input.type = "password";
     await setWindowMode(collapsed ? "collapsed" : "expanded");
+    if (transitionRevision !== setupTransitionRevision) return;
     startPolling();
     if (setupReturnFocus?.isConnected) setupReturnFocus.focus();
     setupReturnFocus = null;
@@ -615,15 +695,21 @@ async function showSetup(show, mode = "manage", source = keySource) {
   setupMode = mode;
   renderSetupContent(source);
 
-  overlay.classList.remove("hidden");
-  overlay.setAttribute("aria-hidden", "false");
+  widget.classList.add("is-setup-open");
+  resetLiquidGlass();
   header.inert = true;
   content.inert = true;
   await setWindowMode("setup");
+  if (transitionRevision !== setupTransitionRevision) return;
 
-  window.setTimeout(() => {
-    (keySource === "env" ? cancel : input).focus();
-  }, 80);
+  overlay.classList.remove("hidden");
+  overlay.setAttribute("aria-hidden", "false");
+  await nextAnimationFrame();
+  if (transitionRevision !== setupTransitionRevision) return;
+  overlay.classList.add("is-visible");
+  await nextAnimationFrame();
+  if (transitionRevision !== setupTransitionRevision) return;
+  (keySource === "env" ? cancel : input).focus();
 }
 
 async function submitSetup(event) {
@@ -726,17 +812,46 @@ async function hideWidget() {
   }
 }
 
+function renderCollapseControl(isCollapsed) {
+  const button = $("btn-collapse");
+  button.textContent = isCollapsed ? "展开" : "收起";
+  button.title = isCollapsed ? "展开小组件" : "收起小组件";
+  button.setAttribute("aria-label", button.title);
+  button.setAttribute("aria-expanded", String(!isCollapsed));
+}
+
+async function reconcileCollapsedWindowMode(revision, target) {
+  await setWindowMode(target ? "collapsed" : "expanded");
+  if (revision === collapseTransitionRevision) return true;
+  await setWindowMode(collapseTarget ? "collapsed" : "expanded");
+  return false;
+}
+
 async function toggleCollapsed() {
   if (!$("setup-overlay").classList.contains("hidden")) return;
-  collapsed = !collapsed;
-  $("widget").classList.toggle("is-collapsed", collapsed);
-  const button = $("btn-collapse");
-  button.textContent = collapsed ? "展开" : "收起";
-  button.title = collapsed ? "展开小组件" : "收起小组件";
-  button.setAttribute("aria-label", button.title);
-  button.setAttribute("aria-expanded", String(!collapsed));
+  const transitionRevision = ++collapseTransitionRevision;
+  const widget = $("widget");
+  const content = $("content");
+  collapseTarget = !collapseTarget;
+  const target = collapseTarget;
+  const wasVisuallyCollapsed = widget.classList.contains("is-collapsed");
+
+  renderCollapseControl(target);
   resetLiquidGlass();
-  await setWindowMode(collapsed ? "collapsed" : "expanded");
+
+  if (target) {
+    widget.classList.add("is-collapsed");
+    if (!wasVisuallyCollapsed) await waitForTransition(content);
+    if (transitionRevision !== collapseTransitionRevision) return;
+    collapsed = true;
+    await reconcileCollapsedWindowMode(transitionRevision, true);
+    return;
+  }
+
+  if (!await reconcileCollapsedWindowMode(transitionRevision, false)) return;
+  collapsed = false;
+  widget.classList.remove("is-collapsed");
+  if (wasVisuallyCollapsed) await waitForTransition(content);
 }
 
 function setupInteractions() {

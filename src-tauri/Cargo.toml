@@ -1,6 +1,6 @@
 [package]
 name = "claude-usage-widget"
-version = "0.2.0"
+version = "0.2.1"
 description = "A secure multi-provider usage widget for Claude Code"
 authors = ["Claude Usage Widget contributors"]
 edition = "2021"
